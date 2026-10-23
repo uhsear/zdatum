@@ -40,10 +40,11 @@ crash, which is never a finding.
 from __future__ import print_function
 
 import argparse
+import base64
 import collections
 import contextlib
 import csv
-import importlib.util
+import hashlib
 import io
 import math
 import os
@@ -53,6 +54,7 @@ import struct
 import sys
 import tempfile
 import traceback
+import zlib
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -60,8 +62,8 @@ import traceback
 
 FOOT = 0.3048
 # The US survey foot is 1200/3937 metre. The international foot is exactly
-# 0.3048 metre. NIST and NOAA retired the survey foot on 1 January 2023, but
-# files made before then still carry it.
+# 0.3048 metre. NIST and NOAA NGS deprecated the survey foot as of 31 December
+# 2022, but files made before then still carry it.
 US_SURVEY_FOOT = 1200.0 / 3937.0
 UNIT_FACTOR = {"m": 1.0, "ft": FOOT, "usft": US_SURVEY_FOOT}
 UNIT_NAME = {"m": "metre", "ft": "international foot",
@@ -103,6 +105,9 @@ GROUND = 2
 # Fewer pairs than this decide nothing: a median of three is a coin toss.
 MIN_PAIRS = 5
 CHUNK = 50000
+# A CRS record (GeoTIFF keys or WKT) larger than this is not a CRS. A real one
+# is a few kilobytes. The cap stops a forged length from allocating memory.
+MAX_CRS_BYTES = 1 << 20
 
 # Verdicts.
 AGREES = "AGREES"
@@ -231,6 +236,12 @@ def parse_header(raw):
         raise LasError("point record length %d is shorter than the %d bytes "
                        "format %d needs" % (h.rec_len, RECORD_MIN[h.fmt],
                                             h.fmt))
+    if h.size < HEADER_BASE:
+        raise LasError("the header says it is %d bytes, shorter than the %d "
+                       "bytes every LAS header has" % (h.size, HEADER_BASE))
+    if not all(math.isfinite(v) for v in h.scale + h.offset):
+        raise LasError("a scale factor or offset in the header is not a "
+                       "finite number")
     if h.scale[2] == 0.0:
         raise LasError("the Z scale factor is 0, so every Z would be the "
                        "offset")
@@ -238,8 +249,17 @@ def parse_header(raw):
 
 
 def read_records(handle, start, count, wide):
-    """The (user id, record id, payload) of a run of VLRs or EVLRs."""
+    """The (user id, record id, payload) of a run of VLRs or EVLRs.
+
+    The count and every length come from the file. A forged count cannot loop
+    long, because each pass consumes bytes and the first header past the end
+    of the file raises. A length is checked against the bytes that remain
+    before it is read. Only LASF_Projection payloads are read, up to
+    MAX_CRS_BYTES. Any other payload is stepped over and returned as b"".
+    """
     head = EVLR_HEADER if wide else VLR_HEADER
+    handle.seek(0, 2)
+    size = handle.tell()
     out = []
     handle.seek(start)
     for _ in range(count):
@@ -248,11 +268,19 @@ def read_records(handle, start, count, wide):
             raise LasError("truncated: a variable length record header ends "
                            "the file")
         _, user, record, length, _ = head.unpack(block)
-        payload = handle.read(length)
-        if len(payload) < length:
+        user = user.split(b"\0")[0].decode("latin-1")
+        if length > size - handle.tell():
             raise LasError("truncated: a variable length record promises %d "
                            "bytes and the file ends first" % length)
-        out.append((user.split(b"\0")[0].decode("latin-1"), record, payload))
+        if user != "LASF_Projection":
+            handle.seek(length, 1)
+            out.append((user, record, b""))
+            continue
+        if length > MAX_CRS_BYTES:
+            raise LasError("a coordinate system record claims %d bytes, more "
+                           "than the %d this tool will read"
+                           % (length, MAX_CRS_BYTES))
+        out.append((user, record, handle.read(length)))
     return out
 
 
@@ -322,26 +350,63 @@ def claim_from_wkt(text):
                  int(code_match[-1]) if code_match else None, "WKT")
 
 
+def _claim_of(rid, body, ascii_params):
+    if rid == 2112:
+        return claim_from_wkt(body.split(b"\0")[0].decode("utf-8", "replace"))
+    return claim_from_geokeys(body, ascii_params)
+
+
 def read_claim(handle, h):
     """The vertical claim of a file, from the CRS record its header points to.
 
     The WKT bit of the global encoding decides: set means the WKT record,
-    clear means the GeoTIFF keys. A file that holds only the other kind
-    claims nothing, because a reader following the specification would find
-    nothing either.
+    clear means the GeoTIFF keys. Point formats 6 to 10 always mean WKT, and
+    LAS 1.4 calls a clear bit there an error. A file that holds only the other
+    kind of record claims nothing, because a reader following the
+    specification would find nothing either. The specification also calls a
+    second record of one kind an error, so a duplicate, or a pair of records
+    that name different units, is recorded as a conflict on the claim.
     """
     records = read_records(handle, h.size, h.n_vlr, False)
     if h.minor >= 4 and h.n_evlr:
         records += read_records(handle, h.evlr_start, h.n_evlr, True)
-    wanted = 2112 if h.encoding & WKT_BIT else 34735
-    payload = {rid: body for user, rid, body in records
-               if user == "LASF_Projection"}
-    if wanted not in payload:
-        return Claim()
-    if wanted == 2112:
-        return claim_from_wkt(payload[2112].split(b"\0")[0].decode("utf-8",
-                                                                  "replace"))
-    return claim_from_geokeys(payload[34735], payload.get(TAG_ASCII, b""))
+    found = {}
+    for user, rid, body in records:
+        if user == "LASF_Projection":
+            found.setdefault(rid, []).append(body)
+    bit = bool(h.encoding & WKT_BIT)
+    wkt = bit or h.fmt >= 6
+    wanted = 2112 if wkt else 34735
+    other = 34735 if wkt else 2112
+    texts = found.get(TAG_ASCII, [b""])[0]
+    notes = []
+    if h.fmt >= 6 and not bit:
+        notes.append("the WKT bit of the global encoding is clear for point "
+                     "format %d, which the LAS 1.4 specification calls an "
+                     "error. The WKT record was read." % h.fmt)
+    if wanted not in found:
+        claim = Claim()
+        claim.conflict = " ".join(notes) or None
+        return claim
+    claims = [_claim_of(wanted, b, texts) for b in found[wanted]]
+    claim = claims[0]
+    if len(claims) > 1:
+        notes.append("the file holds %d %s records, and the specification "
+                     "calls more than one an error. The first was read."
+                     % (len(claims), "WKT" if wkt else "GeoTIFF key"))
+        if len(set(c.unit for c in claims)) > 1:
+            notes.append("They name different units.")
+    if other in found:
+        rival = _claim_of(other, found[other][0], texts)
+        if rival.unit and claim.unit and rival.unit != claim.unit:
+            notes.append("the file also holds a %s record that names %s, "
+                         "while the one read names %s."
+                         % ("GeoTIFF key" if wkt else "WKT",
+                            UNIT_NAME[rival.unit], UNIT_NAME[claim.unit]))
+    if claim.conflict:
+        notes.append(claim.conflict)
+    claim.conflict = " ".join(notes) or None
+    return claim
 
 
 def header_range_issue(h, zmin, zmax):
@@ -354,6 +419,19 @@ def header_range_issue(h, zmin, zmax):
                 "points span %.4f to %.4f. A tool rescaled the Z values and "
                 "left the header behind, or the other way round."
                 % (h.zmin, h.zmax, zmin, zmax))
+    return None
+
+
+def header_range_unchecked(h, zmin, zmax):
+    """None, or a sentence when the header's Z range cannot be cross-checked.
+
+    A header range of 0 to 0 is what a writer leaves when it never filled the
+    field, so it proves nothing about the points.
+    """
+    if h.zmin == 0.0 and h.zmax == 0.0 and (zmin, zmax) != (0.0, 0.0):
+        return ("the header records a Z range of 0 to 0, so it could not be "
+                "cross-checked against the points (%.4f to %.4f)."
+                % (zmin, zmax))
     return None
 
 
@@ -507,6 +585,10 @@ def parse_grid(text):
     if missing:
         raise GridError("the ASCII grid header lacks: %s"
                          % ", ".join(missing))
+    if ("xllcenter" in head) != ("yllcenter" in head):
+        raise GridError("the ASCII grid gives one origin as a cell centre "
+                        "and the other as a corner. Esri requires both to "
+                        "match.")
     try:
         ncols, nrows = int(head["ncols"]), int(head["nrows"])
         cell = float(head["cellsize"])
@@ -636,7 +718,8 @@ def residuals_under(pairs, ref_unit, unit):
 # -------------------------------------------------------------------- report
 
 def signed(value):
-    return "%+.4f m" % value
+    """A signed length that never prints a negative zero."""
+    return "%+.4f m" % (0.0 if abs(value) < 5e-5 else value)
 
 
 def gate(report):
@@ -699,17 +782,21 @@ def describe(report, sample=DEFAULT_SAMPLE):
 def verdict_line(report):
     d, tol = report.diagnosis, report.tolerance
     c_unit = UNIT_NAME[report.unit]
-    named = "assumed" if report.assumed else "the header names"
+    named = "assumed" if report.assumed else "named by the header"
     fit = d.fit
     if d.kind == AGREES:
         text = ("AGREES. The Z values match the reference to within %.3f m "
-                "in the %s (%s)." % (tol, c_unit, named))
+                "read as %s (%s)." % (tol, c_unit, named))
     elif d.kind == UNIT:
         text = ("UNIT. The unit is %s (%s), but the Z values fit the "
                 "reference as %s (median %s, spread %.4f m). Do not use the "
                 "Z values until the header or the data is fixed."
                 % (c_unit, named, UNIT_NAME[fit.unit], signed(fit.median),
                    fit.spread))
+        if fit.unit != "m":
+            text += (" The international foot and the US survey foot differ "
+                     "by 2 parts per million, too little for this check to "
+                     "say which one the data holds.")
     elif d.kind in (OFFSET, UNIT_OFFSET):
         text = ("%s. The Z values sit a steady %s from the reference (spread "
                 "%.4f m)" % (d.kind, signed(fit.median), fit.spread))
@@ -739,8 +826,9 @@ def verdict_line(report):
 
 def residual_rows(report):
     unit = report.unit
-    return [{"x": p.x, "y": p.y, "lidar_z": p.lidar, "reference_z": p.ref,
-             "points": p.n, "residual_m": r}
+    return [{"x": "%.3f" % p.x, "y": "%.3f" % p.y,
+             "lidar_z": "%.4f" % p.lidar, "reference_z": "%.4f" % p.ref,
+             "points": p.n, "residual_m": "%.4f" % r}
             for p, r in residuals_under(report.pairs, report.ref_unit, unit)]
 
 
@@ -852,10 +940,10 @@ def _usage_problem(args):
     if not args.ref_unit:
         return ("--ref-unit is required. The unit of the reference is never "
                 "guessed.")
-    if not args.tolerance > 0:
-        return "--tolerance must be above 0."
-    if args.radius <= 0:
-        return "--radius must be above 0."
+    if not (math.isfinite(args.tolerance) and args.tolerance > 0):
+        return "--tolerance must be a number above 0."
+    if not (math.isfinite(args.radius) and args.radius > 0):
+        return "--radius must be a number above 0."
     if args.min_points < 1 or args.max_samples < 1 or args.sample < 0:
         return ("--min-points and --max-samples must be 1 or more, and "
                 "--sample cannot be negative.")
@@ -926,6 +1014,8 @@ def _run(argv):
             if unit is None:
                 print("%s: LAS %d.%d, point format %d, %d point(s)"
                       % (args.tile, h.major, h.minor, h.fmt, h.n_points))
+                if claim.conflict:
+                    print("FINDING   %s" % claim.conflict)
                 print("VERDICT: REFUSED. The header names no vertical unit, "
                       "so there is no claim to check. Name the unit with "
                       "--assume-unit if you know it. The datum itself "
@@ -951,6 +1041,9 @@ def _run(argv):
         args.control or args.grid, sink.note, args.ref_unit, pairs, thin,
         n_ground, header_range_issue(h, zmin, zmax), args.tolerance,
         args.big_offset)
+    unchecked = header_range_unchecked(h, zmin, zmax)
+    if unchecked:
+        report.notes.append("note: %s" % unchecked)
     if claim.unit and args.assume_unit:
         report.notes.append("--assume-unit ignored: the header names the "
                             "unit.")
@@ -981,10 +1074,1355 @@ def _run(argv):
 
 
 # SELF-TEST-BEGIN
+# ----------------------------------------------------------------- self-test
+
+# Two files written by laspy 2.7.0 (zlib, then base64), kept as bytes a
+# third-party writer produced so the reader is not tested only against the
+# writer in this file. WKT14: LAS 1.4, point format 6, the WKT bit set, one
+# vertical CRS record for EPSG:5703. KEYS12: LAS 1.2, point format 1, a
+# GeoTIFF key directory with no vertical key. Both hold three points at X
+# 1001..1003, Y 2001..2003, Z 10.5, 11.25 and 12.0, classes 2, 2 and 1.
+_LASPY_WKT14 = (
+    "eNrFU89u0zAYb9kEHDlw4oCsSIhNyqp1bOumHmjWdm1Y25Sm7YaiCnmJSUwTu7Kd"
+    "dh1X7jwCb4B4DF6DKw+B+Nxkgk7bGSvO9/P38/fXdsdyTwuFJ4Xbo7jpDNvNQeH+"
+    "EWM5W6K9UqW0eyf/svjr0aL4exN8werh83sdfXr6rfXz+vPr23JF1r7UMvm1tmZ0"
+    "kevbuezkfONm31YuX9TuirlR+N+jA41/3xf8I/EV5axQe/x2w2nV0VBgJj9wkWCt"
+    "RgPicxHkNuPmYFgfuJ7Rs8aNoyMUERpGyjDHDWs46oKaCxUhKyGC+pihMREKQIwa"
+    "WKUJKh8fHRkTs+5685wwyxPTurDBYSjwnKrljiAxViTIPaOt9rZhpjOz0+y1hu1R"
+    "zx56RkKUIAaYTsyRa7Wanlt3+k3PaBEeELk0EWEhZQRyYCGSqZgT0Ck+4xBjFlEf"
+    "JXg2A64EuViDpuUZXXJFfY52EGcy4oKU0IhRnYWrIBmJtiDONtB1pzdyEWYBsuDy"
+    "TfFfC0CgusQJruYcSEGvOVuBKbQUyyqq45hCaxkFbZ3HXOCAa8SYPgQ/VVXUgAYs"
+    "sCBVdAo8DWAnFCZCbWIHOIL9dhxTxin4s1lAsQ5h8wX8z/IwZ4Sp1J8uq6jDUyqz"
+    "LV0MTdFCLGMoQSMpsR+lkigFRl3qRzTETCPIR3KljaiU+oOGZQueCo04UyunPXIp"
+    "smp7ZI6DlVygNk5mMqK6CL18Q4Qkywxnrc7wOy6mgFZ3po4Fh6rwzbqBp6sEnIjC"
+    "bmcaQ+W6uY4gIYcc+4QxuYzneNXLQQRHj2yZFebydM1jtr7xOCS6OkmIhle6XSOF"
+    "o6q+rAmUBYBCt1duzzFUwUKlA54Tqf6lqPTh7KlmljzJr9PJiXPhlfdLB2WzXNkr"
+    "7e+ZlXJp39w5PCwd6/tqNzyj2XdbhnlQ2X01mRT0w9Lz2Wb2wB6sPdEf+SR3smYx"
+    "m99ztrjG/gEnDE0p")
+_LASPY_KEYS12 = (
+    "eNrzcQx2Y8ACGJn8Qzxcgxhwg5zE4oJKBSM9cz0DrPLqjK/YHzM8hpknw8CMw6Bq"
+    "kXXuD6ta7NFpsKRDvwOEnu+AoikCKu4BpX2g8i4wdRpQWtUhBUiCsBQLWIAJ2ZgT"
+    "UJyKRU6HEYI3QOQYkeUARZgfSA==")
+
+WKT_NAVD88_FTUS = (
+    'VERT_CS["NAVD88 height (ftUS)",VERT_DATUM["North American Vertical '
+    'Datum 1988",2005,AUTHORITY["EPSG","5103"]],UNIT["US survey foot",'
+    '0.304800609601219,AUTHORITY["EPSG","9003"]],AXIS["Gravity-related '
+    'height",UP],AUTHORITY["EPSG","6360"]]')
+WKT_NAVD88_M2 = (
+    'VERTCRS["NAVD88 height",VDATUM["North American Vertical Datum 1988"],'
+    'CS[vertical,1],AXIS["gravity-related height (H)",up,LENGTHUNIT['
+    '"metre",1]],ID["EPSG",5703]]')
+WKT_COMPOUND = (
+    'COMPD_CS["Flat plus height",PROJCS["Flat",GEOGCS["G",DATUM["D",'
+    'SPHEROID["S",6378137,298.25,AUTHORITY["EPSG","7019"]]],PRIMEM["P",0],'
+    'UNIT["degree",0.0174532925199433]],UNIT["US survey foot",'
+    '0.304800609601219,AUTHORITY["EPSG","9003"]]],'
+    'VERT_CS["Local height",VERT_DATUM["Local",2005],UNIT["metre",1],'
+    'AXIS["Gravity-related height",UP]]]')
+
+
 def self_test():
-    return 0
+    """Run the assertions in a temp directory that is removed even when one
+    of them raises, so a crash never leaves zdatum-selftest-* behind."""
+    tmp = tempfile.mkdtemp(prefix="zdatum-selftest-")
+    try:
+        return _self_test(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _terrain(x, y):
+    """The synthetic ground, in metres: a slope with 11 m of relief over a
+    100 by 100 unit square. It needs that much, because with less the metre
+    and foot readings of a tile cannot be told apart at the default tolerance
+    and the tool, correctly, will not decide."""
+    return 12.0 + 0.06 * (x - 1000.0) + 0.05 * (y - 2000.0)
+
+
+def _lattice(step=5):
+    return [(1000 + step * i, 2000 + step * j)
+            for i in range(100 // step + 1) for j in range(100 // step + 1)]
+
+
+# Eight control points on lattice nodes, well inside the square.
+_CONTROL_XY = [(1020, 2020), (1080, 2020), (1020, 2080), (1080, 2080),
+               (1050, 2050), (1030, 2060), (1070, 2040), (1040, 2090)]
+
+
+def _build_las(points, minor=2, fmt=1, scale=(0.01, 0.01, 0.01),
+               offset=(0.0, 0.0, 0.0), vlrs=(), evlrs=(), encoding=0,
+               zrange=None, rec_len=None, count=None, fmt_byte=None,
+               extra=0):
+    """LAS bytes for points of (x, y, z, class). A test fixture writer: it
+    reads nothing back and shares no code with the reader."""
+    size = 375 if minor >= 4 else 227
+    head = bytearray(size)
+    head[0:4] = b"LASF"
+    head[24], head[25] = 1, minor
+    struct.pack_into("<H", head, 6, encoding)
+    struct.pack_into("<H", head, 94, size)
+    block = b""
+    for user, rid, payload in vlrs:
+        block += struct.pack("<H16sHH32s", 0, user.encode("ascii"), rid,
+                             len(payload), b"") + payload
+    struct.pack_into("<II", head, 96, size + len(block), len(vlrs))
+    head[104] = fmt if fmt_byte is None else fmt_byte
+    natural = {0: 20, 1: 28, 6: 30}[fmt] + extra
+    struct.pack_into("<H", head, 105, rec_len or natural)
+    n = len(points) if count is None else count
+    struct.pack_into("<I", head, 107, n if minor < 4 or fmt < 6 else 0)
+    struct.pack_into("<3d", head, 131, *scale)
+    struct.pack_into("<3d", head, 155, *offset)
+    zs = [p[2] for p in points] or [0.0]
+    zlo, zhi = zrange if zrange else (min(zs), max(zs))
+    struct.pack_into("<2d", head, 211, zhi, zlo)
+    body = b""
+    for x, y, z, cls in points:
+        ix = int(round((x - offset[0]) / scale[0]))
+        iy = int(round((y - offset[1]) / scale[1]))
+        iz = int(round((z - offset[2]) / scale[2]))
+        if fmt == 6:
+            rec = struct.pack("<iiiHBBBBhHd", ix, iy, iz, 0, 0x11, 0, cls,
+                              0, 0, 0, 0.0)
+        elif fmt == 1:
+            rec = struct.pack("<iiiHBBbBHd", ix, iy, iz, 0, 0x09, cls, 0,
+                              0, 0, 0.0)
+        else:
+            rec = struct.pack("<iiiHBBbBH", ix, iy, iz, 0, 0x09, cls, 0, 0,
+                              0)
+        body += rec + b"\0" * extra
+    tail = b""
+    if evlrs:
+        struct.pack_into("<Q", head, 235, size + len(block) + len(body))
+        struct.pack_into("<I", head, 243, len(evlrs))
+        for user, rid, payload in evlrs:
+            tail += struct.pack("<H16sHQ32s", 0, user.encode("ascii"), rid,
+                                len(payload), b"") + payload
+    if minor >= 4:
+        struct.pack_into("<Q", head, 247, n)
+    return bytes(head) + block + body + tail
+
+
+def _geokeys(vertical=None, units=None, citation=None):
+    """A GeoKeyDirectoryTag payload and the GeoAsciiParamsTag that goes
+    with it, as (directory bytes, ascii bytes)."""
+    keys, text = [(1024, 0, 1, 1)], b""
+    if vertical is not None:
+        keys.append((KEY_VERTICAL, 0, 1, vertical))
+    if citation is not None:
+        text = citation.encode("ascii") + b"|"
+        keys.append((KEY_CITATION, TAG_ASCII, len(text), 0))
+    if units is not None:
+        keys.append((KEY_UNITS, 0, 1, units))
+    flat = [1, 1, 0, len(keys)] + [v for key in keys for v in key]
+    return struct.pack("<%dH" % len(flat), *flat), text
+
+
+def _crs_vlrs(vertical=None, units=None, citation=None):
+    directory, text = _geokeys(vertical, units, citation)
+    out = [("LASF_Projection", 34735, directory)]
+    if text:
+        out.append(("LASF_Projection", 34737, text))
+    return out
+
+
+class _Harness(object):
+    """The check()/raises() recorder, a class so the self-test can test it."""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def check(self, cond, label):
+        if cond:
+            self.passed += 1
+            print("PASS  %s" % label)
+        else:
+            self.failed.append(label)
+            print("FAIL  %s" % label)
+
+    def raises(self, fn, label, kind=ValueError):
+        try:
+            fn()
+        except kind:
+            self.check(True, label)
+        except Exception as exc:
+            self.check(False, "%s (wrong exception %r)" % (label, exc))
+        else:
+            self.check(False, "%s (no error raised)" % label)
+
+    def footer(self):
+        """Print the closing line and return the process exit status."""
+        print("-" * 68)
+        total = self.passed + len(self.failed)
+        if self.failed:
+            print("%d assertions, %d failed" % (total, len(self.failed)))
+            for label in self.failed:
+                print("  FAILED: %s" % label)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+
+def unpack(text):
+    """Bytes from the zlib plus base64 text of a fixture."""
+    return zlib.decompress(base64.b64decode(text))
+
+
+def _self_test(tmp):
+    """Assertions over the decision core and the whole CLI. No network, no
+    credentials. The only files are the ones written under tmp."""
+    harness = _Harness()
+    check, raises = harness.check, harness.raises
+
+    def path(name):
+        return os.path.join(tmp, name)
+
+    def slurp(file_path):
+        with open(file_path, "rb") as handle:
+            return handle.read()
+
+    def put(name, data):
+        with open(path(name), "wb") as handle:
+            handle.write(data)
+        return path(name)
+
+    def put_text(name, text):
+        return put(name, text.encode("utf-8"))
+
+    def run(*argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def tile_points(f=lambda z: z, veg=False):
+        pts = [(x, y, f(_terrain(x, y)), 2) for x, y in _lattice()]
+        if veg:
+            pts += [(x, y, f(_terrain(x, y)) + 8.0, 1)
+                    for x, y in _CONTROL_XY]
+        return pts
+
+    def control_csv(name, unit_scale=1.0, shift=0.0, header="X,Y,Z"):
+        rows = [header]
+        for x, y in _CONTROL_XY:
+            rows.append("%d,%d,%.4f" % (x, y,
+                                        _terrain(x, y) * unit_scale + shift))
+        return put_text(name, "\n".join(rows) + "\n")
+
+    def tile(name, f=lambda z: z, vlrs=None, **kw):
+        if vlrs is None:
+            vlrs = _crs_vlrs(5703)
+        veg = kw.pop("veg", False)
+        pts = kw.pop("points", None) or tile_points(f, veg)
+        return put(name, _build_las(pts, vlrs=vlrs, **kw))
+
+    def error_of(fn, kind=ValueError):
+        """The message of the error fn raises, or "" when it raises none."""
+        try:
+            fn()
+        except kind as exc:
+            return str(exc)
+        return ""
+
+    def pairs_of(refs, f, n=1):
+        return [Pair(float(i), 0.0, f(r), r, n) for i, r in enumerate(refs)]
+
+    print("zdatum self-test: temporary files only, no network, no "
+          "credentials")
+    print("-" * 68)
+
+    # ---- the units the whole check rests on
+    check(FOOT == 0.3048,
+          "the international foot is exactly 0.3048 metre")
+    check(US_SURVEY_FOOT == 1200.0 / 3937.0
+          and abs(US_SURVEY_FOOT - 0.3048006096012192) < 1e-15,
+          "the US survey foot is 1200/3937 metre, 0.3048006096 to ten places")
+    check(UNIT_FACTOR == {"m": 1.0, "ft": 0.3048, "usft": 1200.0 / 3937.0}
+          and set(UNIT_CHOICES) == set(UNIT_FACTOR)
+          and set(UNIT_NAME) == set(UNIT_FACTOR),
+          "every unit has a factor and a name, and the flag offers them all")
+    check(EPSG_UNIT == {9001: "m", 9002: "ft", 9003: "usft"},
+          "the GeoTIFF unit codes are the EPSG ones: 9001 metre, 9002 foot, "
+          "9003 US survey foot")
+    check(len(VERTICAL_CRS) == 8
+          and VERTICAL_CRS[5703] == ("NAVD88 height", "m")
+          and VERTICAL_CRS[6360] == ("NAVD88 height (ftUS)", "usft")
+          and VERTICAL_CRS[8228] == ("NAVD88 height (ft)", "ft")
+          and VERTICAL_CRS[5702] == ("NGVD29 height (ftUS)", "usft")
+          and VERTICAL_CRS[7968] == ("NGVD29 height (m)", "m"),
+          "the vertical CRS table holds the EPSG codes checked against PROJ, "
+          "and 5702 is the US survey foot one, not metres"
+          "  <-- pinned defect")
+    check(other_unit("m") == "ft" and other_unit("ft") == "m"
+          and other_unit("usft") == "m",
+          "the other unit of metres is feet, and of either foot is metres")
+
+    # ---- median and spread
+    check(median([3.0, 1.0, 2.0]) == 2.0, "the median of three is the middle")
+    check(median([4.0, 1.0, 2.0, 3.0]) == 2.5,
+          "the median of four is the mean of the middle two")
+    raises(lambda: median([]), "the median of nothing is refused")
+    check(residual_stats([1.0, 1.0, 1.0]) == (1.0, 0.0),
+          "equal residuals have no spread")
+    check(residual_stats([0.0, 1.0, 2.0, 3.0, 100.0]) == (2.0, 1.0),
+          "one wild residual does not move the median or the spread")
+
+    # ---- the decision core, on pairs with no files at all
+    refs = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+    d = diagnose(pairs_of(refs, lambda r: r), "m", "m")
+    check(d.kind == AGREES and d.fit.unit == "m" and d.fit.median == 0.0,
+          "Z equal to the reference in the claimed unit AGREES")
+    check(abs(d.relief - 5.0) < 1e-12 and d.n == 6,
+          "the relief of the reference is its range, here 5 m, over 6 pairs")
+    d = diagnose(pairs_of(refs, lambda r: r / FOOT), "m", "m")
+    check(d.kind == UNIT and d.fit.unit == "ft"
+          and abs(d.fit.median) < 1e-9,
+          "metres claimed but the values are the reference in feet is UNIT"
+          "  <-- pinned defect")
+    d = diagnose(pairs_of(refs, lambda r: r), "ft", "m")
+    check(d.kind == UNIT and d.fit.unit == "m",
+          "feet claimed but the values are the reference in metres is UNIT")
+    d = diagnose(pairs_of(refs, lambda r: r), "usft", "m")
+    check(d.kind == UNIT and d.fit.unit == "m",
+          "US survey feet claimed but the values are metres is UNIT too")
+    d = diagnose(pairs_of(refs, lambda r: r - 27.0), "m", "m")
+    check(d.kind == OFFSET and abs(d.fit.median + 27.0) < 1e-9
+          and d.fit.unit == "m",
+          "a steady 27 m below the reference is OFFSET, units as claimed"
+          "  <-- pinned defect")
+    d = diagnose(pairs_of(refs, lambda r: (r + 3.0) / FOOT), "m", "m")
+    check(d.kind == UNIT_OFFSET and d.fit.unit == "ft"
+          and abs(d.fit.median - 3.0) < 1e-9,
+          "feet that also sit 3 m high is UNIT_OFFSET, never plain OFFSET")
+    d = diagnose(pairs_of(refs, lambda r: r + 0.25), "m", "m")
+    check(d.kind == AGREES,
+          "a bias inside the tolerance AGREES, because the tolerance is "
+          "the definition of agreeing")
+    d = diagnose(pairs_of(refs, lambda r: r + 0.31), "m", "m")
+    check(d.kind == OFFSET,
+          "a bias a hundredth over the tolerance is OFFSET")
+    d = diagnose(pairs_of(refs, lambda r: r + 0.31), "m", "m", 0.5)
+    check(d.kind == AGREES, "a wider tolerance moves the same bias to AGREES")
+    scrambled = [10.0, 20.0, 11.0, 25.0, 12.0, 30.0]
+    d = diagnose(pairs_of(refs, lambda r: scrambled[int(r) - 10]), "m", "m")
+    check(d.kind == SCATTER and d.fit is None and len(d.tests) == 2,
+          "residuals that fit no single shift in either unit are SCATTER")
+    d = diagnose(pairs_of([0.05, 0.07, 0.06, 0.08, 0.05, 0.07],
+                          lambda r: r), "m", "m")
+    check(d.kind == UNDECIDED and "too little to tell" in d.reason,
+          "a reference near zero cannot tell metres from feet, so the "
+          "answer is NOT DECIDED, not AGREES"
+          "  <-- pinned defect")
+    d = diagnose(pairs_of([20.0, 20.01, 19.99, 20.0, 20.02, 19.98],
+                          lambda r: r + 3.0), "m", "m")
+    check(d.kind == UNDECIDED,
+          "a flat reference with a bias fits both units with a shift, so "
+          "that is NOT DECIDED, not OFFSET"
+          "  <-- pinned defect")
+    d = diagnose(pairs_of([20.0, 20.01, 19.99, 20.0, 20.02, 19.98],
+                          lambda r: r), "m", "m")
+    check(d.kind == AGREES,
+          "a flat reference that agrees is AGREES, because only one reading "
+          "is unbiased")
+    d = diagnose(pairs_of(refs[:4], lambda r: r), "m", "m")
+    check(d.kind == UNDECIDED and "only 4 pair(s)" in d.reason
+          and d.tests == [],
+          "four pairs are too few: NOT DECIDED, with no residual claimed")
+    d = diagnose([], "m", "m")
+    check(d.kind == UNDECIDED and d.n == 0,
+          "no pairs at all is NOT DECIDED")
+    d = diagnose(pairs_of([x / FOOT for x in refs], lambda r: r * FOOT),
+                 "m", "ft")
+    check(d.kind == AGREES,
+          "a reference in feet is converted before it is compared")
+    d = diagnose(pairs_of([x / US_SURVEY_FOOT for x in refs],
+                          lambda r: r * US_SURVEY_FOOT), "m", "usft")
+    check(d.kind == AGREES,
+          "and a reference in US survey feet is converted with its own "
+          "factor")
+
+    # ---- the header range check
+    h = Header()
+    h.scale, h.zmin, h.zmax = (0.01, 0.01, 0.01), 5.0, 9.0
+    check(header_range_issue(h, 5.0, 9.0) is None,
+          "a header range equal to the points' range is fine")
+    check(header_range_issue(h, 5.01, 8.99) is None,
+          "one scale step of slack is allowed for rounding")
+    check("5.0000 to 9.0000" in header_range_issue(h, 5.0, 29.5),
+          "a header whose range differs from the points' range is named")
+    check("5.0000 to 9.0000" in header_range_issue(h, 6.5, 9.0),
+          "and so is a minimum that is off")
+    h.zmin = h.zmax = 0.0
+    check(header_range_issue(h, 5.0, 9.0) is None,
+          "a header range of 0 to 0 means not recorded, and is not a finding")
+
+    # ---- the public header block
+    pts = [(1000.0 + i, 2000.0 + i, 10.0 + i * 0.5, 2) for i in range(6)]
+    raw = _build_las(pts, minor=2, fmt=1, scale=(0.01, 0.01, 0.005),
+                     offset=(500.0, 600.0, 7.0))
+    h = parse_header(raw[:375])
+    check((h.major, h.minor, h.fmt, h.rec_len, h.n_points) == (1, 2, 1, 28, 6)
+          and h.size == 227 and h.point_offset == 227 and h.n_vlr == 0,
+          "a LAS 1.2 header gives version, format, record length, point "
+          "count and where the points start")
+    check(h.scale == (0.01, 0.01, 0.005) and h.offset == (500.0, 600.0, 7.0)
+          and (h.zmin, h.zmax) == (10.0, 12.5),
+          "the scale, the offset and the Z range come from the right bytes: "
+          "the header stores max Z before min Z"
+          "  <-- pinned defect")
+    raw14 = _build_las(pts, minor=4, fmt=6, vlrs=_crs_vlrs(5703))
+    h = parse_header(raw14[:375])
+    check((h.minor, h.fmt, h.rec_len, h.size) == (4, 6, 30, 375)
+          and h.n_points == 6 and h.n_vlr == 1,
+          "a LAS 1.4 header takes the point count from the 64-bit field, "
+          "because the legacy count is 0 for format 6"
+          "  <-- pinned defect")
+    raises(lambda: parse_header(b""), "an empty file is not LAS", LasError)
+    raises(lambda: parse_header(b"PK\x03\x04" + b"\0" * 300),
+           "a file that does not start with LASF is refused", LasError)
+    raises(lambda: parse_header(b"LASF" + b"\0" * 100),
+           "a header cut short is refused", LasError)
+    raises(lambda: parse_header(raw14[:300]),
+           "a LAS 1.4 header cut before byte 375 is refused", LasError)
+    bad = bytearray(raw)
+    bad[24] = 2
+    raises(lambda: parse_header(bytes(bad)),
+           "LAS version 2.0 is refused", LasError)
+    bad = bytearray(raw)
+    bad[25] = 5
+    raises(lambda: parse_header(bytes(bad)),
+           "LAS version 1.5 is refused, because its header is unknown",
+           LasError)
+    laz = _build_las(pts, fmt_byte=0x81)
+    laz_message = error_of(lambda: parse_header(laz[:375]), LasError)
+    check("LAZ" in laz_message and "bit 7" in laz_message,
+          "LAZ (point format plus 128) is refused by name, not read as junk"
+          "  <-- pinned defect")
+    raises(lambda: parse_header(_build_las(pts, fmt_byte=11)[:375]),
+           "point format 11 is not defined and is refused", LasError)
+    raises(lambda: parse_header(_build_las(pts, rec_len=20)[:375]),
+           "a record length shorter than the format needs is refused",
+           LasError)
+    raises(lambda: parse_header(_build_las([], scale=(0.01, 0.01, 0.0))[:375]),
+           "a Z scale factor of 0 is refused", LasError)
+
+    # ---- bytes written by a third party
+    third = unpack(_LASPY_WKT14)
+    h = parse_header(third[:375])
+    check((h.minor, h.fmt, h.n_points, h.encoding & WKT_BIT)
+          == (4, 6, 3, WKT_BIT) and h.scale == (0.01, 0.01, 0.01),
+          "a LAS 1.4 file written by laspy has its header read correctly")
+    put("laspy14.las", third)
+    with open(path("laspy14.las"), "rb") as handle:
+        claim = read_claim(handle, parse_header(handle.read(375)))
+        got = []
+
+        class Collect(object):
+            def add(self, x, y, z):
+                got.append((round(x, 3), round(y, 3), round(z, 3)))
+
+        stats = scan(handle, parse_header(third[:375]), Collect())
+    check(claim.unit == "m" and claim.code == 5703
+          and claim.name == "NAVD88 height" and claim.source == "WKT",
+          "the WKT record laspy wrote for EPSG:5703 reads as NAVD88 metres")
+    check(got == [(1001.0, 2001.0, 10.5), (1002.0, 2002.0, 11.25)]
+          and stats == (10.5, 12.0, 2),
+          "the points laspy wrote scan back exactly, and the class 1 point "
+          "is not ground")
+    keys12 = unpack(_LASPY_KEYS12)
+    put("laspy12.las", keys12)
+    with open(path("laspy12.las"), "rb") as handle:
+        h12 = parse_header(handle.read(375))
+        claim = read_claim(handle, h12)
+    check((h12.minor, h12.fmt, h12.n_points) == (2, 1, 3)
+          and claim.unit is None and h12.n_vlr == 0,
+          "a LAS 1.2 file written by laspy has no CRS record at all, so it "
+          "claims nothing about Z")
+
+    # ---- the GeoTIFF claim
+    c = claim_from_geokeys(*_geokeys(5703))
+    check((c.unit, c.code, c.name, c.conflict, c.source)
+          == ("m", 5703, "NAVD88 height", None, "GeoTIFF keys"),
+          "vertical key 5703 is NAVD88 height in metres")
+    c = claim_from_geokeys(*_geokeys(6360, 9003))
+    check(c.unit == "usft" and c.conflict is None,
+          "6360 with a unit key of 9003 agrees with itself")
+    c = claim_from_geokeys(*_geokeys(6360, 9001))
+    check(c.unit == "usft" and "EPSG:6360" in c.conflict
+          and "metre" in c.conflict,
+          "6360 with a unit key of metres contradicts itself, and the claim "
+          "keeps the CRS's own unit"
+          "  <-- pinned defect")
+    c = claim_from_geokeys(*_geokeys(5701, 9002, "Local height"))
+    check(c.unit == "ft" and c.name == "Local height" and c.code == 5701,
+          "an unknown code takes its unit from the unit key and its name "
+          "from the citation")
+    c = claim_from_geokeys(*_geokeys(5701))
+    check(c.unit is None and c.code == 5701 and c.name is None,
+          "an unknown code with no unit key claims no unit")
+    c = claim_from_geokeys(*_geokeys(None, 9001))
+    check(c.unit == "m" and c.code is None,
+          "a unit key alone still gives the unit")
+    c = claim_from_geokeys(*_geokeys())
+    check(c.unit is None and c.code is None,
+          "a directory with only horizontal keys claims nothing")
+    c = claim_from_geokeys(b"\x01\x00\x01")
+    check(c.unit is None and c.source == "GeoTIFF keys",
+          "a directory shorter than its own 4-value header claims nothing")
+    directory, _ = _geokeys(5703)
+    short = bytearray(directory)
+    struct.pack_into("<H", short, 6, 9)
+    c = claim_from_geokeys(bytes(short))
+    check(c.code == 5703,
+          "a key count larger than the directory holds is clipped, not "
+          "read past the end")
+
+    # ---- the WKT claim
+    c = claim_from_wkt(WKT_NAVD88_FTUS)
+    check((c.unit, c.code, c.name, c.source)
+          == ("usft", 6360, "NAVD88 height (ftUS)", "WKT"),
+          "WKT 1 for EPSG:6360 reads as US survey feet, and the last "
+          "authority is the CRS's, not the datum's or the unit's"
+          "  <-- pinned defect")
+    c = claim_from_wkt(WKT_NAVD88_M2)
+    check((c.unit, c.code) == ("m", 5703),
+          "WKT 2 for EPSG:5703 reads as metres through LENGTHUNIT and ID")
+    c = claim_from_wkt(WKT_COMPOUND)
+    check(c.unit == "m" and c.name == "Local height" and c.code is None,
+          "in a compound CRS the vertical part is read, not the horizontal "
+          "feet before it")
+    c = claim_from_wkt('PROJCS["Flat",UNIT["US survey foot",0.3048006096]]')
+    check(c.unit is None and c.name is None and c.source == "WKT",
+          "a WKT with no vertical CRS claims nothing")
+    c = claim_from_wkt('VERT_CS["Odd",UNIT["cubit",0.4572]]')
+    check(c.unit is None and c.name == "Odd",
+          "a vertical unit this tool has no factor for claims no unit")
+    c = claim_from_wkt('VERT_CS[UNIT["metre",1]]')
+    check(c.unit == "m" and c.name is None,
+          "a vertical CRS with no quoted name still gives its unit")
+    c = claim_from_wkt('VERT_CS["Cut",UNIT["metre",1]')
+    check(c.unit == "m" and c.name == "Cut",
+          "a WKT cut off before its closing bracket still reads")
+    c = claim_from_wkt('VERT_CS["No unit",AXIS["h",UP]]')
+    check(c.unit is None,
+          "a vertical CRS that names no unit claims none")
+
+    # ---- which record the file's CRS is in
+    def claim_of(name, **kw):
+        put(name, _build_las(pts, **kw))
+        with open(path(name), "rb") as handle:
+            return read_claim(handle, parse_header(handle.read(375)))
+
+    wkt = [("LASF_Projection", 2112, WKT_NAVD88_FTUS.encode("ascii") + b"\0")]
+    c = claim_of("c_geotiff.las", vlrs=_crs_vlrs(6360))
+    check(c.unit == "usft" and c.source == "GeoTIFF keys",
+          "with the WKT bit clear the GeoTIFF keys are the claim")
+    c = claim_of("c_wkt.las", minor=4, fmt=6, vlrs=wkt, encoding=WKT_BIT)
+    check(c.unit == "usft" and c.source == "WKT",
+          "with the WKT bit set the WKT record is the claim")
+    c = claim_of("c_evlr.las", minor=4, fmt=6, evlrs=wkt, encoding=WKT_BIT)
+    check(c.unit == "usft" and c.source == "WKT",
+          "a LAS 1.4 WKT record in an EVLR after the points is found")
+    c = claim_of("c_bit_no_wkt.las", minor=4, fmt=6, vlrs=_crs_vlrs(6360),
+                 encoding=WKT_BIT)
+    check(c.unit is None,
+          "the WKT bit set with only GeoTIFF keys present claims nothing, "
+          "as the specification's table says it should")
+    c = claim_of("c_wkt_no_bit.las", vlrs=wkt)
+    check(c.unit is None,
+          "a WKT record with the WKT bit clear claims nothing")
+    c = claim_of("c_other_user.las",
+                 vlrs=[("someone_else", 34735, _geokeys(6360)[0])])
+    check(c.unit is None,
+          "a record under another user id is not the CRS, even with the "
+          "same record id")
+    c = claim_of("c_none.las")
+    check(c.unit is None, "a file with no records claims nothing")
+
+    good = _build_las([], vlrs=_crs_vlrs(6360))
+    broken = bytearray(good)
+    struct.pack_into("<I", broken, 100, 2)
+    put("vlr_missing.las", bytes(broken))
+    with open(path("vlr_missing.las"), "rb") as handle:
+        raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+               "a header that counts more records than the file holds is "
+               "refused", LasError)
+    put("vlr_cut.las", good[:227 + 54 + 3])
+    with open(path("vlr_cut.las"), "rb") as handle:
+        raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+               "a record that promises more bytes than remain is refused",
+               LasError)
+
+    # ---- the point scan
+    class Sink(object):
+        def __init__(self):
+            self.got = []
+
+        def add(self, x, y, z):
+            self.got.append((x, y, z))
+
+    def scan_bytes(name, data, **kw):
+        put(name, data)
+        sink = Sink()
+        with open(path(name), "rb") as handle:
+            h = parse_header(handle.read(375))
+            stats = scan(handle, h, sink, **kw)
+        return sink.got, stats
+
+    mixed = [(1.0, 2.0, 10.0, 2), (3.0, 4.0, 20.0, 1), (5.0, 6.0, 30.0, 2),
+             (7.0, 8.0, 40.0, 2 + 32), (9.0, 10.0, 50.0, 7)]
+    got, stats = scan_bytes("scan1.las", _build_las(mixed, fmt=1))
+    check([g[2] for g in got] == [10.0, 30.0, 40.0] and stats == (10.0, 50.0, 3),
+          "format 1 keeps the ground points, and a class byte with flag "
+          "bits above the low five still counts as ground"
+          "  <-- pinned defect")
+    got, stats = scan_bytes("scan6.las", _build_las(mixed, minor=4, fmt=6))
+    check([g[2] for g in got] == [10.0, 30.0] and stats == (10.0, 50.0, 2),
+          "format 6 reads the class from byte 16 as a whole byte, so class "
+          "34 is not ground there"
+          "  <-- pinned defect")
+    got, stats = scan_bytes("scan0.las", _build_las(mixed, fmt=0))
+    check([g[2] for g in got] == [10.0, 30.0, 40.0],
+          "format 0 reads the same class byte as format 1")
+    got, _ = scan_bytes("scan_any.las", _build_las(mixed), any_class=True)
+    check(len(got) == 5, "any_class compares every point")
+    got, _ = scan_bytes("scan_g7.las", _build_las(mixed), ground_class=7)
+    check([g[2] for g in got] == [50.0],
+          "another ground class is honoured")
+    got, stats = scan_bytes(
+        "scan_extra.las", _build_las(mixed, fmt=1, extra=4))
+    check([g[2] for g in got] == [10.0, 30.0, 40.0],
+          "extra bytes after each record, which the header's record length "
+          "declares, are skipped, not read as the next record"
+          "  <-- pinned defect")
+    got, stats = scan_bytes(
+        "scan_off.las", _build_las(mixed, scale=(0.01, 0.01, 0.005),
+                                   offset=(100.0, 200.0, 1000.0)))
+    check(tuple(round(v, 6) for v in got[0]) == (1.0, 2.0, 10.0)
+          and tuple(round(v, 6) for v in stats[:2]) == (10.0, 50.0),
+          "X, Y and Z are record times scale plus offset, so they read back "
+          "as written when neither is trivial")
+    got, stats = scan_bytes(
+        "scan_neg.las", _build_las(mixed, scale=(0.01, 0.01, -0.01)))
+    check(stats[0] <= stats[1]
+          and tuple(round(v, 6) for v in stats[:2]) == (10.0, 50.0),
+          "a negative Z scale still reports the Z range low to high")
+    got, stats = scan_bytes("scan_empty.las", _build_las([]))
+    check(got == [] and stats == (0.0, 0.0, 0),
+          "a tile with no points scans to nothing without an error")
+    put("scan_short.las", _build_las(mixed, count=9))
+    with open(path("scan_short.las"), "rb") as handle:
+        h = parse_header(handle.read(375))
+        raises(lambda: scan(handle, h, Sink()),
+               "a header that counts more points than the file holds is "
+               "refused", LasError)
+
+    many = [(float(i), 0.0, i * 0.01, 2) for i in range(50)]
+    put("many.las", _build_las(many))
+    picked = {}
+    saved = globals()["CHUNK"]
+    try:
+        for chunk in (50000, 7, 1):
+            globals()["CHUNK"] = chunk
+            sink = Sink()
+            with open(path("many.las"), "rb") as handle:
+                h = parse_header(handle.read(375))
+                scan(handle, h, sink, stride=3)
+            picked[chunk] = [int(round(g[0])) for g in sink.got]
+    finally:
+        globals()["CHUNK"] = saved
+    check(picked[50000] == list(range(0, 50, 3))
+          and picked[7] == picked[50000] and picked[1] == picked[50000],
+          "stride 3 picks the same points whatever the read chunk size"
+          "  <-- pinned defect")
+
+    # ---- control points
+    ctl = Controls([(0.0, 0.0, 5.0), (100.0, 0.0, 6.0)], 10.0)
+    for x in (0.0, 10.0, 10.01, -10.0):
+        ctl.add(x, 0.0, 1.0)
+    ctl.add(6.0, 8.0, 2.0)
+    ctl.add(7.0, 8.0, 3.0)
+    check(sorted(ctl.heights[0]) == [1.0, 1.0, 1.0, 2.0],
+          "a point exactly at the radius is inside it, a hundredth beyond "
+          "is outside, and the distance is straight-line")
+    got_pairs, thin = ctl.pairs(2)
+    check(thin == 1 and len(got_pairs) == 1 and got_pairs[0].n == 4
+          and got_pairs[0].lidar == 1.0 and got_pairs[0].ref == 5.0,
+          "a control point with too few ground points is counted, not "
+          "compared, and the median of the rest is used")
+    ctl = Controls([(9.9, 9.9, 1.0)], 10.0)
+    ctl.add(10.1, 10.1, 4.0)
+    check(ctl.heights == [[4.0]],
+          "a ground point in the next grid cell over is still found "
+          "within the radius"
+          "  <-- pinned defect")
+    ctl = Controls([(-5.0, -5.0, 1.0)], 10.0)
+    ctl.add(-4.0, -4.0, 4.0)
+    check(ctl.heights == [[4.0]],
+          "negative coordinates index cells the same way")
+
+    # ---- the ASCII grid
+    grid_text = ("ncols 3\nnrows 3\nxllcorner 100\nyllcorner 200\n"
+                 "cellsize 10\nNODATA_value -9999\n"
+                 "1 2 3\n4 5 6\n7 8 -9999\n")
+    g = parse_grid(grid_text)
+    check((g.ncols, g.nrows, g.cellsize) == (3, 3, 10.0),
+          "the grid header gives columns, rows and cell size")
+    check(g.value_at(105.0, 225.0) == 1.0 and g.value_at(125.0, 225.0) == 3.0
+          and g.value_at(105.0, 205.0) == 7.0,
+          "the first data row is the top row, and a corner origin puts "
+          "the first cell centre half a cell in"
+          "  <-- pinned defect")
+    check(abs(g.value_at(110.0, 220.0) - 3.0) < 1e-12,
+          "the value between four cell centres is their bilinear mean")
+    check(abs(g.value_at(107.5, 225.0) - 1.25) < 1e-12,
+          "and a quarter of the way along a row it is a quarter of the "
+          "way between the two cells")
+    check(g.value_at(104.9, 225.0) is None and g.value_at(105.0, 230.1) is None
+          and g.value_at(125.1, 225.0) is None
+          and g.value_at(105.0, 204.9) is None,
+          "outside the ring of cell centres there is no value")
+    check(g.value_at(125.0, 205.0) is None and g.value_at(120.0, 210.0) is None,
+          "a cell holding NoData, or an interpolation touching one, gives "
+          "no value")
+    g = parse_grid("NCOLS 2\nNROWS 2\nXLLCENTER 0\nYLLCENTER 0\nCELLSIZE 1\n"
+                   "1 2 3 4")
+    check(g.value_at(0.0, 1.0) == 1.0 and g.value_at(1.0, 0.0) == 4.0
+          and abs(g.value_at(0.5, 0.5) - 2.5) < 1e-12,
+          "keywords are not case sensitive, the centre origin is not "
+          "shifted, and line breaks between values are not needed")
+    g = parse_grid("ncols 2 nrows 1 xllcorner 0 yllcorner 0 cellsize 2\n"
+                   "-9999 7\n")
+    check(g.value_at(3.0, 1.0) == 7.0 and g.value_at(1.0, 1.0) is None,
+          "NoData defaults to -9999 when the header does not say"
+          "  <-- pinned defect")
+    g = parse_grid("ncols 1 nrows 1 xllcorner 0 yllcorner 0 cellsize 4 "
+                   "nodata_value 0 9")
+    check(g.value_at(2.0, 2.0) == 9.0 and g.value_at(2.1, 2.0) is None,
+          "a one-cell grid answers only at its centre")
+    g = parse_grid("ncols 2 nrows 1 xllcorner 0 yllcorner 0 cellsize 1 "
+                   "nan 5")
+    check(g.rows == [[None, 5.0]],
+          "a nan cell is NoData")
+    for label, text in (
+            ("a header with no ncols", "nrows 1 xllcorner 0 yllcorner 0 "
+                                      "cellsize 1 5"),
+            ("a header with no origin", "ncols 1 nrows 1 cellsize 1 5"),
+            ("an x origin by centre and a y origin by corner",
+             "ncols 1 nrows 1 xllcenter 0 yllcorner 0 cellsize 1 5"),
+            ("a header with no y origin", "ncols 1 nrows 1 xllcorner 0 "
+                                         "cellsize 1 5"),
+            ("a header value that is not a number", "ncols x nrows 1 "
+             "xllcorner 0 yllcorner 0 cellsize 1 5"),
+            ("a cell size of zero", "ncols 1 nrows 1 xllcorner 0 yllcorner 0 "
+                                    "cellsize 0 5"),
+            ("zero columns", "ncols 0 nrows 1 xllcorner 0 yllcorner 0 "
+                             "cellsize 1"),
+            ("too few cell values", "ncols 2 nrows 2 xllcorner 0 yllcorner 0 "
+                                    "cellsize 1 1 2 3"),
+            ("too many cell values", "ncols 1 nrows 1 xllcorner 0 yllcorner 0 "
+                                     "cellsize 1 1 2"),
+            ("a cell that is not a number", "ncols 1 nrows 1 xllcorner 0 "
+                                            "yllcorner 0 cellsize 1 abc"),
+            ("an empty file", "")):
+        raises(lambda t=text: parse_grid(t), "%s is refused" % label,
+               GridError)
+    put_text("g_bom.asc", "\ufeff" + grid_text)
+    check(parse_grid(read_text(path("g_bom.asc"))).ncols == 3,
+          "a byte order mark in front of the grid header is skipped")
+
+    # ---- the control CSV
+    put_text("c_bom.csv", "\ufeffX,Y,Z\n1,2,3\n4,5,x\n,6,7\n8,9,inf\n10,11,12\n")
+    pts_read, skipped = read_controls(path("c_bom.csv"), "X", "Y", "Z")
+    check(pts_read == [(1.0, 2.0, 3.0), (10.0, 11.0, 12.0)] and skipped == 3,
+          "a byte order mark is skipped, and rows with a blank, a word or an "
+          "infinity are counted as skipped, not read as zero"
+          "  <-- pinned defect")
+    put_text("c_cols.csv", "E,N,H\n1,2,3\n")
+    pts_read, _ = read_controls(path("c_cols.csv"), "E", "N", "H")
+    check(pts_read == [(1.0, 2.0, 3.0)], "the column names are configurable")
+    raises(lambda: read_controls(path("c_cols.csv"), "X", "Y", "H"),
+           "a column that is not in the CSV is refused by name",
+           ColumnError)
+    put_text("c_empty.csv", "")
+    empty_message = error_of(
+        lambda: read_controls(path("c_empty.csv"), "X", "Y", "Z"),
+        ColumnError)
+    check("no columns at all" in empty_message,
+          "an empty CSV says it has no columns")
+    check(to_number("1.5") == 1.5 and to_number("nan") is None
+          and to_number(None) is None and to_number("") is None,
+          "to_number reads a finite float and nothing else")
+
+    # ---- hardening: values the file controls
+    nan = float("nan")
+    raises(lambda: parse_header(_build_las([], scale=(0.01, 0.01, nan))[:375]),
+           "a Z scale factor of NaN is refused, not read as a number",
+           LasError)
+    raises(lambda: parse_header(_build_las([], scale=(nan, 0.01, 0.01))[:375]),
+           "an X scale factor of NaN is refused", LasError)
+    raises(lambda: parse_header(
+        _build_las([], offset=(0.0, float("inf"), 0.0))[:375]),
+        "an infinite offset is refused", LasError)
+    short_header = bytearray(_build_las(pts))
+    struct.pack_into("<H", short_header, 94, 100)
+    raises(lambda: parse_header(bytes(short_header[:375])),
+           "a header that says it is 100 bytes is refused", LasError)
+
+    wkt_rec = ("LASF_Projection", 2112, WKT_NAVD88_M2.encode("ascii") + b"\0")
+
+    def claim_file(name, **kw):
+        put(name, _build_las(pts, minor=4, fmt=6, **kw))
+        with open(path(name), "rb") as handle:
+            return read_claim(handle, parse_header(handle.read(375)))
+
+    base = _build_las(pts, minor=4, fmt=6, evlrs=[wkt_rec], encoding=WKT_BIT)
+    huge = bytearray(base)
+    struct.pack_into("<I", huge, 243, 4294967295)
+    put("evlr_count.las", bytes(huge))
+    with open(path("evlr_count.las"), "rb") as handle:
+        raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+               "an EVLR count of 4 billion stops at the first missing header, "
+               "not after 4 billion passes"
+               "  <-- pinned defect", LasError)
+    huge = bytearray(base)
+    start = struct.unpack_from("<Q", huge, 235)[0]
+    struct.pack_into("<Q", huge, start + 20, 2 ** 63)
+    put("evlr_len.las", bytes(huge))
+    with open(path("evlr_len.las"), "rb") as handle:
+        raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+               "an EVLR length of 2^63 is refused, not allocated"
+               "  <-- pinned defect", LasError)
+    saved = globals()["MAX_CRS_BYTES"]
+    try:
+        globals()["MAX_CRS_BYTES"] = 8
+        put("evlr_cap.las", base)
+        with open(path("evlr_cap.las"), "rb") as handle:
+            raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+                   "a CRS record over the size cap is refused", LasError)
+        big = [("other_vendor", 7, b"\1" * 500), wkt_rec]
+        put("evlr_skip.las", _build_las(pts, minor=4, fmt=6, evlrs=big,
+                                        encoding=WKT_BIT))
+        globals()["MAX_CRS_BYTES"] = 4096
+        with open(path("evlr_skip.las"), "rb") as handle:
+            c = read_claim(handle, parse_header(handle.read(375)))
+    finally:
+        globals()["MAX_CRS_BYTES"] = saved
+    check(c.unit == "m",
+          "a large record of another vendor is stepped over, and the CRS "
+          "record after it is still found")
+
+    # ---- hardening: which CRS record, duplicates and disagreement
+    c = claim_file("k_bit_clear.las", vlrs=[wkt_rec])
+    check(c.unit == "m" and "WKT bit" in c.conflict,
+          "point format 6 with the WKT bit clear reads the WKT record and "
+          "names the error"
+          "  <-- pinned defect")
+    c = claim_file("k_bit_clear_keys.las", vlrs=_crs_vlrs(6360))
+    check(c.unit is None and "WKT bit" in c.conflict,
+          "point format 6 with the WKT bit clear and only GeoTIFF keys "
+          "claims nothing, and says why"
+          "  <-- pinned defect")
+    c = claim_file("k_dup.las", vlrs=[wkt_rec, wkt_rec], encoding=WKT_BIT)
+    check(c.unit == "m" and "2 WKT records" in c.conflict
+          and "different units" not in c.conflict,
+          "two identical WKT records are named as a duplicate"
+          "  <-- pinned defect")
+    ftus = ("LASF_Projection", 2112, WKT_NAVD88_FTUS.encode("ascii") + b"\0")
+    c = claim_file("k_dup_units.las", vlrs=[wkt_rec, ftus],
+                   encoding=WKT_BIT)
+    check(c.unit == "m" and "different units" in c.conflict,
+          "two WKT records that name different units say so, and the first "
+          "is the one read"
+          "  <-- pinned defect")
+    keys2 = _crs_vlrs(5703) + _crs_vlrs(6360)[:1]
+    c = claim_of("k_dup_keys.las", vlrs=keys2)
+    check(c.unit == "m" and "2 GeoTIFF key records" in c.conflict,
+          "two GeoTIFF key directories are named as a duplicate")
+    c = claim_file("k_rival.las", vlrs=[wkt_rec] + _crs_vlrs(6360),
+                   encoding=WKT_BIT)
+    check(c.unit == "m" and "GeoTIFF key record that names US survey foot"
+          in c.conflict,
+          "a WKT record and GeoTIFF keys that name different units are a "
+          "conflict"
+          "  <-- pinned defect")
+    c = claim_of("k_rival_old.las", vlrs=[wkt_rec] + _crs_vlrs(6360))
+    check(c.unit == "usft" and "WKT record that names metre" in c.conflict,
+          "and the same from a LAS 1.2 file, read the other way round")
+    c = claim_file("k_agree.las", vlrs=[wkt_rec] + _crs_vlrs(5703),
+                   encoding=WKT_BIT)
+    check(c.unit == "m" and c.conflict is None,
+          "a WKT record and GeoTIFF keys that agree are not a conflict")
+    c = claim_file("k_super.las", vlrs=[("LASF_Spec", 2112,
+                                         ftus[2]), wkt_rec],
+                   encoding=WKT_BIT)
+    check(c.unit == "m" and c.conflict is None,
+          "a superseded CRS record (LASF_Spec) is ignored, so the live one "
+          "is not a duplicate")
+    c = claim_file("k_conflict_kept.las", vlrs=[wkt_rec, wkt_rec]
+                   + _crs_vlrs(6360, 9001), encoding=WKT_BIT)
+    check("2 WKT records" in c.conflict and c.unit == "m",
+          "a conflict already on the claim is kept beside the new notes")
+    keys_bad = _crs_vlrs(6360, 9001)
+    c = claim_of("k_self.las", vlrs=keys_bad)
+    check("EPSG:6360" in c.conflict and c.unit == "usft",
+          "a claim that contradicts itself keeps that finding")
+
+    c = claim_of("k_cit.las", vlrs=_crs_vlrs(5701, 9002, "Local height"))
+    check(c.unit == "ft" and c.name == "Local height",
+          "the GeoTIFF citation in the ASCII params record names the CRS")
+    put("vlr_short.las", _build_las(
+        [], vlrs=[("someone_else", 1, b"\0" * 60)]))
+    cut_file = bytearray(slurp(path("vlr_short.las")))
+    struct.pack_into("<I", cut_file, 100, 2)
+    put("vlr_short.las", bytes(cut_file))
+    with open(path("vlr_short.las"), "rb") as handle:
+        message = error_of(lambda: read_claim(
+            handle, parse_header(handle.read(375))), LasError)
+    check("record header ends the file" in message,
+          "a record list whose second header is cut off by the end of the "
+          "file is refused by name")
+    check(error_of(lambda: None) == "",
+          "error_of reports no error as an empty message")
+
+    # ---- hardening: a header range of 0 to 0
+    h = Header()
+    check(header_range_unchecked(h, 5.0, 9.0) is not None
+          and "could not be cross-checked" in header_range_unchecked(
+              h, 5.0, 9.0),
+          "a header range of 0 to 0 over points that are not at 0 is "
+          "reported as not cross-checked, not passed in silence"
+          "  <-- pinned defect")
+    check(header_range_unchecked(h, 0.0, 0.0) is None,
+          "and over points that are all at 0 there is nothing to report")
+    h.zmin, h.zmax = 1.0, 2.0
+    check(header_range_unchecked(h, 5.0, 9.0) is None,
+          "a recorded range is not an unchecked one")
+
+    check(signed(-1e-7) == "+0.0000 m" and signed(-0.5) == "-0.5000 m"
+          and signed(27.0) == "+27.0000 m",
+          "a residual too small to show prints as +0.0000, never -0.0000"
+          "  <-- pinned defect")
+
+    # ---- the whole tool, one run per outcome
+    def go(*argv):
+        return run(*argv)
+
+    ok = tile("ok.las")
+    ctl_m = control_csv("ctl_m.csv")
+    code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 0 and "VERDICT: AGREES" in out and err == "",
+          "metres in the tile and the control agree: exit 0")
+    check("8 compared, 0 skipped" in out
+          and "header claims: NAVD88 height (EPSG:5703), unit metre" in out
+          and "8 control point(s) read, 0 row(s) skipped" in out,
+          "the report names the claim, the control count and the pairs")
+    check("FINDING" not in out and "pairs furthest" not in out,
+          "an agreeing tile prints no finding and no list of worst pairs")
+
+    feet_tile = tile("feet.las", f=lambda z: z / FOOT)
+    code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: UNIT." in out
+          and "fit the reference as international foot" in out
+          and "2 parts per million" in out
+          and "pairs furthest from the reference" in out,
+          "a tile that claims metres and holds feet: exit 1, UNIT, with the "
+          "worst pairs listed"
+          "  <-- pinned defect")
+    code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
+                      "--sample", "0")
+    check(code == 1 and "pairs furthest" not in out,
+          "--sample 0 turns the worst-pairs list off")
+    code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
+                      "--sample", "2")
+    check(out.count("  x 10") == 2, "--sample 2 lists two pairs")
+
+    low = tile("low27.las", f=lambda z: z - 27.0)
+    code, out, _ = go(low, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: OFFSET." in out and "-27.0000 m" in out
+          and "test the ellipsoid-height explanation first" in out
+          and "cannot tell them apart" in out,
+          "a steady 27 m shift: exit 1, OFFSET, the ellipsoid hint, and "
+          "the admission that the cause is unknown"
+          "  <-- pinned defect")
+    code, out, _ = go(tile("low1.las", f=lambda z: z - 1.0),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: OFFSET." in out
+          and "test the ellipsoid-height" not in out,
+          "a steady 1 m shift is OFFSET without the ellipsoid hint")
+    code, out, _ = go(low, "--control", ctl_m, "--ref-unit", "m",
+                      "--big-offset", "40")
+    check("test the ellipsoid-height" not in out,
+          "--big-offset moves the line above which the hint appears")
+    code, out, _ = go(tile("ft_high.las", f=lambda z: (z + 3.0) / FOOT),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: UNIT_OFFSET." in out
+          and "only if they are read as international foot" in out,
+          "feet that also sit 3 m high: UNIT_OFFSET, with the reading named")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                      "--tolerance", "0.001")
+    check(code == 0, "an exact tile passes even a 1 mm tolerance")
+    code, out, _ = go(tile("off25.las", f=lambda z: z + 0.25),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 0 and "VERDICT: AGREES" in out,
+          "a 0.25 m bias is inside the default 0.30 m tolerance")
+
+    rows = ["X,Y,Z"] + ["%d,%d,%.4f" % (x, y, [30.0, 11.0, 50.0, 12.0, 40.0,
+                                                  13.0, 55.0, 14.0][i])
+                        for i, (x, y) in enumerate(_CONTROL_XY)]
+    code, out, _ = go(ok, "--control", put_text("ctl_scatter.csv",
+                                                "\n".join(rows) + "\n"),
+                      "--ref-unit", "m")
+    check(code == 1 and "VERDICT: SCATTER." in out,
+          "control that fits no single shift: exit 1, SCATTER")
+
+    code, out, _ = go(ok, "--control", control_csv("ctl_ft.csv",
+                                                   unit_scale=1 / FOOT),
+                      "--ref-unit", "ft")
+    check(code == 0 and "declared international foot" in out,
+          "control in feet with --ref-unit ft is converted and agrees")
+    code, out, _ = go(ok, "--control",
+                      control_csv("ctl_usft.csv", unit_scale=1 / US_SURVEY_FOOT),
+                      "--ref-unit", "usft")
+    check(code == 0 and "declared US survey foot" in out,
+          "control in US survey feet agrees with its own factor")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "ft")
+    check(code == 1, "declaring the control as feet when it is metres is "
+                     "not hidden")
+
+    code, out, _ = go(ok, "--control", control_csv("ctl_E.csv", header="E,N,H"),
+                      "--ref-unit", "m", "--x-field", "E", "--y-field", "N",
+                      "--z-field", "H")
+    check(code == 0, "--x-field, --y-field and --z-field rename the columns")
+    code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                        "--z-field", "Height")
+    check(code == 64 and "Height" in err,
+          "a column the operator names that is not there is a usage error, "
+          "exit 64, not a data error"
+          "  <-- pinned defect")
+    code, out, _ = go(ok, "--control", put_text(
+        "ctl_dirty.csv", "X,Y,Z\n1020,2020,%.4f\n,,\nx,y,z\n"
+        % _terrain(1020, 2020)), "--ref-unit", "m")
+    check(code == 4 and "2 row(s) skipped" in out
+          and "NOT DECIDED" in out and "only 1 pair(s)" in out,
+          "unreadable control rows are counted, and one good pair decides "
+          "nothing: exit 4")
+    code, out, _ = go(ok, "--control", put_text(
+        "ctl_far.csv", "X,Y,Z\n9000,9000,1\n9100,9000,1\n"),
+        "--ref-unit", "m")
+    check(code == 4 and "0 compared, 2 skipped" in out,
+          "control that lies outside the tile has no overlap: exit 4")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                      "--min-points", "500")
+    check(code == 4 and "0 compared, 8 skipped" in out,
+          "--min-points above what any control point has leaves no pairs")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                      "--radius", "0.5")
+    check(code == 4, "--radius too small to reach a ground point: exit 4")
+
+    flat = tile("flat.las", f=lambda z: 20.0 + 0.0 * z)
+    flat_ctl = put_text("ctl_flat.csv", "X,Y,Z\n" + "\n".join(
+        "%d,%d,%.4f" % (x, y, 17.0 + 0.001 * i)
+        for i, (x, y) in enumerate(_CONTROL_XY)) + "\n")
+    code, out, _ = go(flat, "--control", flat_ctl, "--ref-unit", "m")
+    check(code == 4 and "too little to tell" in out
+          and "Use control that spans more relief" in out,
+          "a flat site with a 3 m bias cannot tell a shift from a unit "
+          "error: NOT DECIDED, exit 4"
+          "  <-- pinned defect")
+
+    # ---- a grid as the reference
+    def grid_file(name, scale=1.0, shift=0.0, x0=997.5):
+        lines = []
+        for r in range(21):
+            y = 2100 - 5 * r
+            lines.append(" ".join(
+                "%.4f" % (_terrain(1000 + 5 * c, y) * scale + shift)
+                for c in range(21)))
+        return put_text(name, "ncols 21\nnrows 21\nxllcorner %s\n"
+                        "yllcorner 1997.5\ncellsize 5\nNODATA_value -9999\n"
+                        % x0 + "\n".join(lines) + "\n")
+
+    grid_m = grid_file("dem_m.asc")
+    code, out, err = go(ok, "--grid", grid_m, "--ref-unit", "m")
+    check(code == 0 and "VERDICT: AGREES" in out
+          and "441 compared, 0 skipped" in out and "21 x 21 grid" in out,
+          "a tile against a grid in the same unit: exit 0, every ground "
+          "point compared")
+    code, out, _ = go(feet_tile, "--grid", grid_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: UNIT." in out,
+          "grid mode finds the same unit error as control mode")
+    code, out, _ = go(ok, "--grid", grid_m, "--ref-unit", "m",
+                      "--max-samples", "100")
+    check(code == 0 and "111 compared" in out,
+          "--max-samples 100 takes every 4th point of 441, which is 111")
+    code, out, _ = go(ok, "--grid", grid_file("dem_ft.asc", 1 / FOOT),
+                      "--ref-unit", "ft")
+    check(code == 0, "a grid in feet with --ref-unit ft agrees")
+    code, out, _ = go(tile("g_low.las", f=lambda z: z - 27.0), "--grid",
+                      grid_m, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: OFFSET." in out,
+          "a steady shift is found against a grid too")
+    code, out, _ = go(ok, "--grid", grid_file("dem_far.asc", x0=50000.0),
+                      "--ref-unit", "m")
+    check(code == 4 and "0 compared, 441 skipped" in out,
+          "a grid that does not cover the tile: exit 4, every point counted "
+          "as skipped")
+    code, out, err = go(ok, "--grid", put_text("bad.asc", "ncols 2\n"),
+                        "--ref-unit", "m")
+    check(code == 2 and "lacks" in err,
+          "a malformed grid is a data error: exit 2")
+
+    # ---- the claim decides what is checked
+    nolabel = tile("nolabel.las", vlrs=[])
+    code, out, err = go(nolabel, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 3 and "REFUSED" in out and "--assume-unit" in out,
+          "a header with no vertical unit is refused: exit 3, never "
+          "guessed")
+    code, out, _ = go(nolabel, "--control", ctl_m, "--ref-unit", "m",
+                      "--assume-unit", "m")
+    check(code == 0 and "ASSUMED with --assume-unit" in out
+          and "header claims: no vertical CRS" in out
+          and "read as metre (assumed)" in out,
+          "--assume-unit lets a tile with no claim be checked, and the "
+          "report says the unit was assumed")
+    code, out, _ = go(tile("coded.las", vlrs=_crs_vlrs(5701)),
+                      "--control", ctl_m, "--ref-unit", "m",
+                      "--assume-unit", "m")
+    check(code == 0 and "unnamed vertical CRS (EPSG:5701), unit not stated"
+          in out,
+          "a code with no unit is reported as such, and --assume-unit "
+          "fills the gap")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                      "--assume-unit", "ft")
+    check(code == 0 and "--assume-unit ignored" in out,
+          "--assume-unit never overrides a unit the header names")
+    code, out, _ = go(nolabel, "--control", ctl_m, "--ref-unit", "m",
+                      "--assume-unit", "ft")
+    check(code == 1 and "VERDICT: UNIT." in out,
+          "an assumed unit that is wrong is a finding")
+
+    contradict = tile("contradict.las", f=lambda z: z / US_SURVEY_FOOT,
+                      vlrs=_crs_vlrs(6360, 9001))
+    code, out, _ = go(contradict, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "FINDING   the vertical CRS EPSG:6360" in out
+          and "VERDICT: AGREES" in out
+          and "The header findings above still stand." in out,
+          "a header that contradicts itself is a finding even when the "
+          "values agree with the unit it resolves to"
+          "  <-- pinned defect")
+    code, out, _ = go(tile("badrange.las", zrange=(5.0, 60.0)),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 1 and "records a Z range of 5.0000 to 60.0000" in out,
+          "a header Z range the points do not match is a finding")
+    code, out, _ = go(tile("zeroed.las", zrange=(0.0, 0.0)),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 0 and "could not be cross-checked" in out
+          and "FINDING" not in out,
+          "a header range of 0 to 0 is a note, not a finding, and the run "
+          "still decides"
+          "  <-- pinned defect")
+    nowkt = put("wkt_ft.las", _build_las(
+        [(x, y, _terrain(x, y) / US_SURVEY_FOOT, 2) for x, y in _lattice()],
+        minor=4, fmt=6, vlrs=[ftus], encoding=WKT_BIT))
+    code, out, _ = go(nowkt, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 0 and "unit US survey foot (from the WKT)" in out,
+          "a LAS 1.4 tile with a WKT claim of US survey feet is read, "
+          "scanned and agrees")
+    code, out, _ = go(put("bit_clear6.las", _build_las(
+        tile_points(), minor=4, fmt=6, vlrs=_crs_vlrs(5703))),
+        "--control", ctl_m, "--ref-unit", "m", "--assume-unit", "m")
+    check(code == 1 and "FINDING   the WKT bit of the global encoding" in out
+          and "ASSUMED" in out,
+          "a claim lost to a clear WKT bit can be assumed, and the header "
+          "error stays a finding")
+    code, out, _ = go(put("bit_clear6b.las", _build_las(
+        tile_points(), minor=4, fmt=6, vlrs=_crs_vlrs(5703))),
+        "--control", ctl_m, "--ref-unit", "m")
+    check(code == 3 and "FINDING   the WKT bit of the global encoding" in out,
+          "a refusal still prints the header conflict that caused it")
+
+    ground_none = tile("noground.las", points=[(x, y, _terrain(x, y), 1)
+                                               for x, y in _lattice()])
+    code, out, _ = go(ground_none, "--control", ctl_m, "--ref-unit", "m")
+    check(code == 4 and "no point has class 2" in out,
+          "a tile with no ground points says so and decides nothing")
+    code, out, _ = go(ground_none, "--control", ctl_m, "--ref-unit", "m",
+                      "--any-class")
+    check(code == 0, "--any-class compares points of every class")
+    code, out, _ = go(ground_none, "--control", ctl_m, "--ref-unit", "m",
+                      "--ground-class", "1")
+    check(code == 0, "--ground-class names another class as the ground")
+    code, out, _ = go(tile("veg.las", veg=True), "--control", ctl_m,
+                      "--ref-unit", "m", "--any-class")
+    check(code == 0, "a few non-ground points do not move a median")
+
+    # ---- files that are not usable
+    code, _, err = go(put("laz.las", _build_las(tile_points(),
+                                                fmt_byte=0x81)),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 2 and "LAZ" in err,
+          "a LAZ tile is refused with its name: exit 2")
+    code, _, err = go(put_text("junk.las", "not a las file at all" * 20),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 2 and "not a LAS file" in err, "a non-LAS file: exit 2")
+    code, _, err = go(path("missing.las"), "--control", ctl_m,
+                      "--ref-unit", "m")
+    check(code == 2 and "missing.las" in err,
+          "a tile that does not exist: exit 2")
+    code, _, err = go(ok, "--control", path("missing.csv"), "--ref-unit", "m")
+    check(code == 2 and "missing.csv" in err,
+          "a control file that does not exist: exit 2")
+    code, _, err = go(put("cut.las", _build_las(tile_points(),
+                                            vlrs=_crs_vlrs(5703))[:900]),
+                      "--control", ctl_m, "--ref-unit", "m")
+    check(code == 2 and "truncated" in err,
+          "a tile cut short is a data error: exit 2")
+    put_text("nul.csv", "X,Y,Z\n1,2,\x00\n")
+    code, _, err = go(ok, "--control", path("nul.csv"), "--ref-unit", "m")
+    check(code in (2, 4), "a control row with a NUL byte does not crash")
+
+    # ---- usage errors are 64, and nothing is written
+    for label, argv, word in (
+            ("no tile", ["--control", ctl_m, "--ref-unit", "m"], "tile"),
+            ("no reference", [ok, "--ref-unit", "m"], "exactly one"),
+            ("two references", [ok, "--control", ctl_m, "--grid", grid_m,
+                                "--ref-unit", "m"], "exactly one"),
+            ("no --ref-unit", [ok, "--control", ctl_m], "--ref-unit"),
+            ("tolerance 0", [ok, "--control", ctl_m, "--ref-unit", "m",
+                             "--tolerance", "0"], "--tolerance"),
+            ("tolerance nan", [ok, "--control", ctl_m, "--ref-unit", "m",
+                               "--tolerance", "nan"], "--tolerance"),
+            ("radius inf", [ok, "--control", ctl_m, "--ref-unit", "m",
+                            "--radius", "inf"], "--radius"),
+            ("radius nan", [ok, "--control", ctl_m, "--ref-unit", "m",
+                            "--radius", "nan"], "--radius"),
+            ("radius 0", [ok, "--control", ctl_m, "--ref-unit", "m",
+                          "--radius", "0"], "--radius"),
+            ("min-points 0", [ok, "--control", ctl_m, "--ref-unit", "m",
+                              "--min-points", "0"], "--min-points"),
+            ("sample -1", [ok, "--control", ctl_m, "--ref-unit", "m",
+                           "--sample", "-1"], "--sample"),
+            ("apply without out", [ok, "--control", ctl_m, "--ref-unit",
+                                   "m", "--apply"], "--apply needs --out"),
+            ("out is the tile", [ok, "--control", ctl_m, "--ref-unit", "m",
+                                 "--out", ok], "also an input"),
+            ("out is the control", [ok, "--control", ctl_m, "--ref-unit",
+                                    "m", "--out", ctl_m], "also an input"),
+            ("out is the grid", [ok, "--grid", grid_m, "--ref-unit", "m",
+                                 "--out", grid_m], "also an input"),
+            ("a unit that is not offered", [ok, "--control", ctl_m,
+                                            "--ref-unit", "yd"], "yd"),
+            ("an unknown flag", [ok, "--control", ctl_m, "--ref-unit", "m",
+                                 "--force"], "--force")):
+        code, out, err = go(*argv)
+        check(code == 64 and word in err and out == "",
+              "usage error, exit 64 and no report: %s" % label)
+
+    # ---- the write flag and the parser
+    target = path("resid.csv")
+    for prefix in ("--ap", "--app", "--appl"):
+        code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                            "--out", target, prefix)
+        check(code == 64 and not os.path.exists(target) and out == "",
+              "a prefix %s of --apply is REFUSED by the parser, and nothing "
+              "is written  <-- pinned defect" % prefix)
+    code, out, err = go("--self", ok)
+    check(code == 64 and "--self" in err,
+          "a prefix --self of --self-test is refused, not run"
+          "  <-- pinned defect")
+    code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                        "--ou", target)
+    check(code == 64 and not os.path.exists(target),
+          "a prefix --ou of --out is refused too")
+    check(_parse(["--self-test"]).self_test is True
+          and _parse([]).apply is False,
+          "the full flags parse, and --apply is off by default")
+    code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m", "--out",
+                        target)
+    check(code == 0 and not os.path.exists(target)
+          and "Check only" in out and "was not written" in out,
+          "--out without --apply writes nothing and says so"
+          "  <-- pinned defect")
+    before = hashlib.sha256(slurp(ok)).hexdigest()
+    code, out, err = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
+                        "--out", target, "--apply")
+    check(code == 1 and os.path.exists(target) and "wrote" in out,
+          "--out with --apply writes the residual CSV, and a finding still "
+          "exits 1")
+    with open(target, "r", newline="") as handle:
+        written = list(csv.DictReader(handle))
+    check(list(written[0].keys()) == list(OUT_COLUMNS) and len(written) == 8,
+          "the residual CSV has the documented columns and one row per pair")
+    check(abs(float(written[0]["residual_m"])) > 5.0
+          and len(written[0]["residual_m"].split(".")[1]) == 4,
+          "and its residuals are the ones for the unit the header claims, to "
+          "four places")
+    go(ok, "--control", ctl_m, "--ref-unit", "m", "--out", target, "--apply")
+    check(hashlib.sha256(slurp(ok)).hexdigest() == before,
+          "the tile is byte for byte what it was after the runs")
+    code, out, err = go(ok, "--control", ctl_m, "--ref-unit", "m", "--out",
+                        tmp, "--apply")
+    check(code == 2 and "could not write" in err,
+          "an --out that cannot be opened is exit 2, not a crash")
+    code, out, err = go("--help")
+    check(code == 0 and "--apply" in out and "Nothing is written without"
+          in out.replace("\n", " ").replace("  ", " "),
+          "--help exits 0 and says nothing is written without --apply")
+
+    # ---- the source itself
+    with open(__file__.replace(".pyc", ".py"), "rb") as handle:
+        source = handle.read()
+    check(max(source) < 128,
+          "the source is pure ASCII")
+    check(not re.search(br"^\s*(import|from)\s+(socket|urllib|http|ssl|"
+                        br"requests|ftplib|smtplib)", source, re.M),
+          "the tool imports nothing that can reach a network")
+    check(not re.search(br"[^\w]f['\"]", source),
+          "the source has no f-string, for Python 3.9")
+
+    # ---- a crash is 70, never a finding
+    real = globals()["_run"]
+
+    def boom(argv):
+        raise RuntimeError("synthetic fault")
+
+    try:
+        globals()["_run"] = boom
+        code, out, err = go(ok)
+    finally:
+        globals()["_run"] = real
+    check(code == 70 and "fault in the tool, not a finding" in err
+          and "RuntimeError" in err,
+          "an unexpected error exits 70, which no scheduled job reads as a "
+          "finding"
+          "  <-- pinned defect")
+
+    # ---- the recorder records a failure
+    inner = _Harness()
+    quiet = io.StringIO()
+    with contextlib.redirect_stdout(quiet):
+        inner.check(False, "a failing check")
+        inner.raises(lambda: None, "no error")
+        inner.raises(lambda: 1 // 0, "wrong error")
+        inner.raises(lambda: int("x"), "the right error")
+        status = inner.footer()
+    check(status == 1 and len(inner.failed) == 3 and inner.passed == 1,
+          "check() and raises() really do record a failure"
+          "  <-- pinned defect")
+    check("4 assertions, 3 failed" in quiet.getvalue()
+          and "FAILED: no error" in quiet.getvalue(),
+          "the footer reports failures by count and by name, and exits 1")
+    with contextlib.redirect_stdout(io.StringIO()) as empty:
+        status = _Harness().footer()
+    check(status == 0 and "0 assertions, 0 failed" in empty.getvalue(),
+          "an empty run reports zero failures and exits 0")
+
+    return harness.footer()
 # SELF-TEST-END
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
