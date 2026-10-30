@@ -29,8 +29,9 @@ CSV named by --out, and only with --apply.
     python zdatum.py tile.las --control ctl.csv --ref-unit m --out r.csv --apply
 
 Exit codes: 0 the Z values agree with the reference in the header's unit, 1 at
-least one finding (a unit mismatch, a steady offset, scatter, a header that
-contradicts itself or its own Z range), 2 a file could not be read or is a
+least one finding (a unit mismatch, a steady offset, scatter, a tile that is
+part right and part wrong, a header that contradicts itself or its own Z
+range; a header finding makes it 1 whatever the verdict), 2 a file could not be read or is a
 format this tool does not read (LAZ), 3 the header names no vertical unit and
 --assume-unit was not given, 4 not decided (too few pairs, no overlap, or a
 reference that cannot tell metres from feet), 64 usage error, 70 an unexpected
@@ -49,6 +50,7 @@ import io
 import math
 import os
 import re
+import runpy
 import shutil
 import struct
 import sys
@@ -104,6 +106,10 @@ DEFAULT_SAMPLE = 10
 GROUND = 2
 # Fewer pairs than this decide nothing: a median of three is a coin toss.
 MIN_PAIRS = 5
+# Share of the pairs that must lie within the tolerance of the fitted shift. A
+# median and a spread both ignore a minority, so without this a tile that is
+# half wrong still passes.
+MIN_SHARE = 0.9
 CHUNK = 50000
 # A CRS record (GeoTIFF keys or WKT) larger than this is not a CRS. A real one
 # is a few kilobytes. The cap stops a forged length from allocating memory.
@@ -115,6 +121,7 @@ UNIT = "UNIT"
 OFFSET = "OFFSET"
 UNIT_OFFSET = "UNIT_OFFSET"
 SCATTER = "SCATTER"
+MIXED = "MIXED"
 UNDECIDED = "UNDECIDED"
 
 # Public header block sizes by LAS minor version (ASPRS LAS 1.4 R15).
@@ -133,7 +140,7 @@ TAG_ASCII = 34737
 OUT_COLUMNS = ("x", "y", "lidar_z", "reference_z", "points", "residual_m")
 
 Pair = collections.namedtuple("Pair", "x y lidar ref n")
-Test = collections.namedtuple("Test", "unit median spread")
+Test = collections.namedtuple("Test", "unit median spread within")
 
 
 class LasError(ValueError):
@@ -341,8 +348,8 @@ def claim_from_wkt(text):
     code_match = re.findall(r'\b(?:AUTHORITY|ID)\s*\[\s*"EPSG"\s*,\s*"?(\d+)',
                             body, re.IGNORECASE)
     unit = None
-    if unit_match:
-        factor = float(unit_match.group(1))
+    factor = to_number(unit_match.group(1)) if unit_match else None
+    if factor is not None:
         for symbol, value in UNIT_FACTOR.items():
             if abs(factor - value) < 1e-9:
                 unit = symbol
@@ -627,17 +634,34 @@ def read_text(path):
         return handle.read()
 
 
+def _csv_encoding(path):
+    """utf-16 when the file starts with a UTF-16 byte order mark, else utf-8.
+
+    Excel's "Unicode Text" and PowerShell's -Encoding Unicode write UTF-16.
+    """
+    with open(path, "rb") as handle:
+        mark = handle.read(2)
+    return "utf-16" if mark in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+
+
 def read_controls(path, xf, yf, zf):
-    """(control points, count of rows skipped) from a CSV."""
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+    """(control points, count of rows skipped) from a CSV.
+
+    X, Y and Z are ASCII numbers, so a byte that is not valid text (a cp1252
+    degree sign in a description column) is replaced, not fatal.
+    """
+    with open(path, "r", encoding=_csv_encoding(path), errors="replace",
+              newline="") as handle:
         reader = csv.DictReader(handle)
         header = reader.fieldnames or []
         absent = [f for f in (xf, yf, zf) if f not in header]
         if absent:
             raise ColumnError(
-                "%s: columns not in the CSV: %s. It has: %s"
-                % (path, ", ".join(absent),
-                   ", ".join(header) if header else "(no columns at all)"))
+                "%s: columns not in the CSV: %s. It has: %s. Column names are "
+                "case sensitive. Name them with --x-field, --y-field and "
+                "--z-field." % (path, ", ".join(absent),
+                                ", ".join(header) if header
+                                else "(no columns at all)"))
         points, skipped = [], 0
         for row in reader:
             x, y, z = (to_number(row.get(f)) for f in (xf, yf, zf))
@@ -679,6 +703,8 @@ def diagnose(pairs, claimed, ref_unit, tolerance=DEFAULT_TOLERANCE):
     in the other unit. For each, the residual (lidar minus reference, in
     metres) has a median, which is the bias, and a spread. The bias counts only
     when the spread is small, because a bias of scattered numbers is noise.
+    It counts only when MIN_SHARE of the pairs lie within the tolerance of it
+    too, because a median and a spread both ignore a minority.
     """
     if len(pairs) < MIN_PAIRS:
         return Diagnosis(UNDECIDED, len(pairs), reason=(
@@ -689,7 +715,9 @@ def diagnose(pairs, claimed, ref_unit, tolerance=DEFAULT_TOLERANCE):
     tests = []
     for unit in (claimed, other_unit(claimed)):
         d = [p.lidar * UNIT_FACTOR[unit] - r for p, r in zip(pairs, refs)]
-        tests.append(Test(unit, *residual_stats(d)))
+        m, spread = residual_stats(d)
+        tests.append(Test(unit, m, spread,
+                          sum(1 for v in d if abs(v - m) <= tolerance)))
     steady = [t for t in tests if t.spread <= tolerance]
     fits = [t for t in steady if abs(t.median) <= tolerance]
     if len(fits) == 2 or (not fits and len(steady) == 2):
@@ -706,6 +734,8 @@ def diagnose(pairs, claimed, ref_unit, tolerance=DEFAULT_TOLERANCE):
         kind = OFFSET if chosen is tests[0] else UNIT_OFFSET
     else:
         return Diagnosis(SCATTER, len(pairs), relief, tests)
+    if chosen.within < MIN_SHARE * len(pairs):
+        kind = MIXED
     return Diagnosis(kind, len(pairs), relief, tests, fit=chosen)
 
 
@@ -725,7 +755,8 @@ def signed(value):
 def gate(report):
     """Exit status for a finished report."""
     d = report.diagnosis
-    if report.findings or d.kind in (UNIT, OFFSET, UNIT_OFFSET, SCATTER):
+    if report.findings or d.kind in (UNIT, OFFSET, UNIT_OFFSET, SCATTER,
+                                    MIXED):
         return 1
     return 4 if d.kind == UNDECIDED else 0
 
@@ -811,6 +842,15 @@ def verdict_line(report):
             text += (" It is over %.1f m, larger than a datum realisation "
                      "usually moves a point, so test the ellipsoid-height "
                      "explanation first." % report.big_offset)
+    elif d.kind == MIXED:
+        text = ("MIXED. Only %d of %d pairs (%.0f percent) lie within %.3f m "
+                "of the one shift that fits best (%s, median %s), and at "
+                "least %.0f percent must. Part of the tile disagrees with "
+                "the rest: two deliveries merged, two units in one file, "
+                "NoData read as heights, or a reference with bad cells."
+                % (fit.within, d.n, 100.0 * fit.within / d.n, tol,
+                   UNIT_NAME[fit.unit], signed(fit.median),
+                   100.0 * MIN_SHARE))
     elif d.kind == SCATTER:
         text = ("SCATTER. Neither unit leaves the residuals within %.3f m "
                 "of one shift (spreads %s). The reference may not cover this "
@@ -926,6 +966,10 @@ def _tolerate_odd_characters():
 
 
 def _same_file(a, b):
+    """True when a and b are one file: a hard link or a case-folded spelling
+    counts, which a comparison of the paths would miss."""
+    if os.path.exists(a) and os.path.exists(b):
+        return os.path.samefile(a, b)
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
         os.path.realpath(b))
 
@@ -1329,6 +1373,16 @@ def _self_test(tmp):
     def pairs_of(refs, f, n=1):
         return [Pair(float(i), 0.0, f(r), r, n) for i, r in enumerate(refs)]
 
+    def report_for(refs, f, claimed="m", ref_unit="m", finding=None,
+                   assumed=False, tolerance=0.30, big_offset=5.0):
+        claim = Claim(claimed, "Test height", 5703, "WKT", finding)
+        return build_report("t.las", Header(), claim, claimed, assumed,
+                            "ref.csv", "note", ref_unit, pairs_of(refs, f), 0,
+                            len(refs), None, tolerance, big_offset)
+
+    def text_of(report):
+        return "\n".join(describe(report))
+
     print("zdatum self-test: temporary files only, no network, no "
           "credentials")
     print("-" * 68)
@@ -1347,6 +1401,9 @@ def _self_test(tmp):
           "the GeoTIFF unit codes are the EPSG ones: 9001 metre, 9002 foot, "
           "9003 US survey foot")
     check(len(VERTICAL_CRS) == 8
+          and VERTICAL_CRS[5714] == ("MSL height", "m")
+          and VERTICAL_CRS[5773] == ("EGM96 height", "m")
+          and VERTICAL_CRS[3855] == ("EGM2008 height", "m")
           and VERTICAL_CRS[5703] == ("NAVD88 height", "m")
           and VERTICAL_CRS[6360] == ("NAVD88 height (ftUS)", "usft")
           and VERTICAL_CRS[8228] == ("NAVD88 height (ft)", "ft")
@@ -1411,7 +1468,8 @@ def _self_test(tmp):
           "residuals that fit no single shift in either unit are SCATTER")
     d = diagnose(pairs_of([0.05, 0.07, 0.06, 0.08, 0.05, 0.07],
                           lambda r: r), "m", "m")
-    check(d.kind == UNDECIDED and "too little to tell" in d.reason,
+    check(d.kind == UNDECIDED and "too little to tell metre from "
+          "international foot" in d.reason,
           "a reference near zero cannot tell metres from feet, so the "
           "answer is NOT DECIDED, not AGREES"
           "  <-- pinned defect")
@@ -1443,6 +1501,144 @@ def _self_test(tmp):
           "and a reference in US survey feet is converted with its own "
           "factor")
 
+    # ---- the edges of every decision
+    dflt = _parse([])
+    check((MIN_PAIRS, MIN_SHARE, DEFAULT_TOLERANCE, DEFAULT_RADIUS,
+           DEFAULT_MIN_POINTS, DEFAULT_MAX_SAMPLES, DEFAULT_BIG_OFFSET,
+           DEFAULT_SAMPLE, GROUND) == (5, 0.9, 0.30, 10.0, 3, 20000, 5.0, 10,
+                                       2)
+          and (dflt.tolerance, dflt.radius, dflt.min_points, dflt.max_samples,
+               dflt.big_offset, dflt.sample, dflt.ground_class, dflt.x_field,
+               dflt.y_field, dflt.z_field)
+          == (0.30, 10.0, 3, 20000, 5.0, 10, 2, "X", "Y", "Z"),
+          "the documented defaults are the ones the flags and the constants "
+          "hold: 0.30 m, radius 10, 3 points, 20000 samples, 5 m, 10 listed, "
+          "class 2, a 5 pair minimum and a 90 percent share")
+    d = diagnose(pairs_of(refs[:5], lambda r: r), "m", "m")
+    check(d.kind == AGREES and d.n == 5,
+          "exactly 5 pairs, the minimum, are enough to decide")
+    d = diagnose(pairs_of(refs, lambda r: r + 0.5), "m", "m", 0.5)
+    check(d.kind == AGREES,
+          "a median exactly equal to the tolerance is inside it")
+    d = diagnose(pairs_of(refs, lambda r: r + 0.5000001), "m", "m", 0.5)
+    check(d.kind == OFFSET,
+          "and a median a ten-millionth over it is not")
+    swing = {10: 0.0, 11: 0.5, 12: -0.5, 13: 0.5, 14: -0.5}
+    d = diagnose(pairs_of(refs[:5], lambda r: r + swing[int(r)]), "m", "m",
+                 0.5)
+    check(d.kind == AGREES and d.tests[0].spread == 0.5,
+          "a spread exactly equal to the tolerance is steady")
+    swing = {10: 0.0, 11: 0.5000001, 12: -0.5000001, 13: 0.5000001,
+             14: -0.5000001}
+    d = diagnose(pairs_of(refs[:5], lambda r: r + swing[int(r)]), "m", "m",
+                 0.5)
+    check(d.kind == SCATTER,
+          "and a spread a ten-millionth over it is scatter")
+
+    # ---- a minority that is wrong cannot hide behind the median
+    ten = [10.0 + i for i in range(10)]
+    d = diagnose(pairs_of(ten, lambda r: r + (40.0 if r < 11.0 else 0.0)),
+                 "m", "m")
+    check(d.kind == AGREES and d.fit.within == 9,
+          "one pair of ten wrong by 40 m is 90 percent, which is the "
+          "share asked for, so the tile still AGREES")
+    d = diagnose(pairs_of(ten, lambda r: r + (40.0 if r < 12.0 else 0.0)),
+                 "m", "m")
+    check(d.kind == MIXED and d.fit.within == 8 and d.fit.unit == "m",
+          "two pairs of ten wrong by 40 m is 80 percent, which is MIXED, "
+          "not AGREES  <-- pinned defect")
+    d = diagnose(pairs_of(ten, lambda r: r + (3.0 if r < 14.0 else 0.0)),
+                 "m", "m")
+    check(d.kind == MIXED,
+          "40 percent of the pairs 3 m high is MIXED too"
+          "  <-- pinned defect")
+    d = diagnose(pairs_of(ten, lambda r: r + (0.5 if r >= 18.0 else 0.0)),
+                 "m", "m", 0.5)
+    check(d.kind == AGREES and d.fit.within == 10,
+          "a pair exactly one tolerance from the median is within it")
+    d = diagnose(pairs_of(ten, lambda r: r / FOOT if r < 14.0 else r),
+                 "m", "m")
+    check(d.kind == MIXED and d.fit.unit == "m",
+          "40 percent of the values in feet under a metre label is MIXED, "
+          "never AGREES  <-- pinned defect")
+    check(gate(report_for(ten, lambda r: r + (40.0 if r < 12.0 else 0.0)))
+          == 1, "MIXED exits 1, as every other finding does")
+
+    # ---- what the report says, and what it must not say
+    bad_ten = report_for(ten, lambda r: r + (40.0 if r < 12.0 else 0.0))
+    text = text_of(bad_ten)
+    check("VERDICT: MIXED. Only 8 of 10 pairs (80 percent) lie within 0.300 m"
+          in text and "at least 90 percent must" in text
+          and "pairs furthest from the reference" in text,
+          "the MIXED verdict gives the count, the share and the bar, and "
+          "lists the pairs that disagree")
+    plain = text_of(report_for(refs, lambda r: r - 6.0))
+    check("OFFSET. The Z values sit a steady -6.0000 m" in plain
+          and "test the ellipsoid-height explanation first" in plain
+          and "only if they are read as" not in plain,
+          "a plain OFFSET names no other unit and, at 6 m, adds the "
+          "ellipsoid hint")
+    plain = text_of(report_for(refs, lambda r: r - 6.0, big_offset=6.0))
+    check("steady -6.0000 m" in plain
+          and "ellipsoid-height explanation" not in plain,
+          "an offset exactly equal to --big-offset adds no ellipsoid hint")
+    both = text_of(report_for(refs, lambda r: (r - 6.0) / FOOT))
+    check("UNIT_OFFSET." in both and "only if they are read as "
+          "international foot, not the metre (named by the header)" in both,
+          "a UNIT_OFFSET names the reading it needs and the unit it left")
+    plain = text_of(report_for(refs, lambda r: r, claimed="ft"))
+    check("VERDICT: UNIT. The unit is international foot" in plain
+          and "fit the reference as metre" in plain
+          and "parts per million" not in plain,
+          "metres held under a foot label is UNIT with no 2 ppm note, "
+          "because the note is only for a foot")
+    plain = text_of(report_for(refs, lambda r: r / FOOT))
+    check("fit the reference as international foot" in plain
+          and "parts per million" in plain,
+          "and a foot held under a metre label is UNIT with the note")
+    plain = text_of(report_for(refs, lambda r: r / FOOT))
+    check([line for line in plain.splitlines()
+           if "in the header's unit" in line][0].count("(metre)") == 1
+          and [line for line in plain.splitlines()
+               if "in the other unit" in line][0].count(
+                   "(international foot)") == 1,
+          "the two residual lines are labelled the right way round: the "
+          "header's unit first, the other unit second  <-- pinned defect")
+    plain = text_of(report_for(refs, lambda r: r, claimed="ft"))
+    check([line for line in plain.splitlines()
+           if "in the header's unit" in line][0].count(
+               "(international foot)") == 1,
+          "and for a foot label the header's unit is the foot")
+    for label, rows in (
+            ("AGREES", lambda r: r), ("UNIT", lambda r: r / FOOT),
+            ("OFFSET", lambda r: r - 6.0)):
+        plain = text_of(report_for(refs, rows))
+        check("The header findings above still stand" not in plain
+              and "FINDING" not in plain,
+              "%s with no finding prints no 'still stand' sentence" % label)
+    for label, rows in (("AGREES", lambda r: r), ("UNIT", lambda r: r / FOOT),
+                        ("OFFSET", lambda r: r - 6.0)):
+        plain = text_of(report_for(refs, rows, finding="a header problem"))
+        check("FINDING   a header problem" in plain
+              and ("still stand" in plain) == (label == "AGREES"),
+              "%s with a finding keeps it, and only AGREES says the "
+              "findings still stand" % label)
+    plain = text_of(report_for(refs[:3], lambda r: r, finding="a problem"))
+    check("NOT DECIDED" in plain and "findings above still stand" in plain
+          and "relief of the reference" not in plain
+          and "if stored Z" not in plain,
+          "NOT DECIDED with a finding says the findings still stand")
+    named = text_of(report_for(refs, lambda r: r))
+    check("(named by the header)" in named and "ASSUMED" not in named
+          and "reference: ref.csv, note, declared metre" in named,
+          "a unit the header named is not called assumed, and the "
+          "reference is named")
+    assumed = text_of(report_for(refs, lambda r: r, assumed=True))
+    check("(assumed)" in assumed and "ASSUMED with --assume-unit" in assumed
+          and "named by the header" not in assumed,
+          "an assumed unit is called assumed, in the header block and in "
+          "the verdict")
+
     # ---- the header range check
     h = Header()
     h.scale, h.zmin, h.zmax = (0.01, 0.01, 0.01), 5.0, 9.0
@@ -1457,6 +1653,21 @@ def _self_test(tmp):
     h.zmin = h.zmax = 0.0
     check(header_range_issue(h, 5.0, 9.0) is None,
           "a header range of 0 to 0 means not recorded, and is not a finding")
+    h.scale, h.zmin, h.zmax = (0.5, 0.5, 0.5), 0.0, 9.0
+    check(header_range_issue(h, 5.0, 9.0) is not None,
+          "a header range that starts at 0 but ends at 9 is still checked")
+    h.zmin, h.zmax = 5.0, 0.0
+    check(header_range_issue(h, 5.0, 9.0) is not None,
+          "and one that starts at 5 and ends at 0")
+    h.scale, h.zmin, h.zmax = (0.5, 0.5, 0.5), 5.0, 9.0
+    check(header_range_issue(h, 5.75, 9.0) is None
+          and header_range_issue(h, 5.0, 8.25) is None,
+          "a difference of exactly one and a half scale steps passes")
+    check(header_range_issue(h, 5.7, 8.3) is None
+          and header_range_issue(h, 6.0, 9.0) is not None
+          and header_range_issue(h, 5.0, 8.0) is not None,
+          "the slack is one and a half scale steps: 0.7 m of 0.5 m steps "
+          "passes, 1.0 m does not, at either end of the range")
 
     # ---- the public header block
     pts = [(1000.0 + i, 2000.0 + i, 10.0 + i * 0.5, 2) for i in range(6)]
@@ -1484,6 +1695,28 @@ def _self_test(tmp):
            "a file that does not start with LASF is refused", LasError)
     raises(lambda: parse_header(b"LASF" + b"\0" * 100),
            "a header cut short is refused", LasError)
+    check("truncated" in error_of(lambda: parse_header(b"LASF"), LasError)
+          and "truncated" in error_of(
+              lambda: parse_header(b"LASF" + b"\0" * 100), LasError)
+          and "b'PK" + chr(92) + "x03" + chr(92) + "x04'" in error_of(
+              lambda: parse_header(b"PK\x03\x04" + b"\0" * 300), LasError),
+          "a header cut short says truncated, even at four bytes, and a "
+          "file that is not LAS shows the four bytes it starts with")
+    check(all(
+        parse_header(_build_las([], fmt=1, fmt_byte=f, rec_len=n)[:375])
+        .fmt == f and "shorter than the %d bytes" % n in error_of(
+            lambda: parse_header(_build_las(
+                [], fmt=1, fmt_byte=f, rec_len=n - 1)[:375]), LasError)
+        for f, n in ((0, 20), (1, 28), (2, 26), (3, 34), (4, 57), (5, 63),
+                     (6, 30), (7, 36), (8, 38), (9, 59), (10, 67))),
+          "every point format defined by LAS 1.4 is accepted at the record "
+          "length the specification gives it and refused one byte shorter")
+    check((HEADER_BASE, HEADER_14, WKT_BIT, KEY_VERTICAL, KEY_CITATION,
+           KEY_UNITS, TAG_ASCII, MAX_CRS_BYTES)
+          == (227, 375, 16, 4096, 4097, 4099, 34737, 1048576),
+          "the header sizes, the WKT bit and the GeoTIFF key numbers are "
+          "the ones in the specifications, written out here on their own, "
+          "because the fixture writer reads the same constants")
     raises(lambda: parse_header(raw14[:300]),
            "a LAS 1.4 header cut before byte 375 is refused", LasError)
     bad = bytearray(raw)
@@ -1568,6 +1801,16 @@ def _self_test(tmp):
     c = claim_from_geokeys(*_geokeys())
     check(c.unit is None and c.code is None,
           "a directory with only horizontal keys claims nothing")
+    directory, _ = _geokeys(5703)
+    fewer = bytearray(directory)
+    struct.pack_into("<H", fewer, 6, 1)
+    c = claim_from_geokeys(bytes(fewer))
+    check(c.code is None,
+          "a directory that declares one key is read as one key, though "
+          "more bytes follow")
+    c = claim_from_geokeys(directory + b"\0")
+    check(c.code == 5703,
+          "and a stray byte after the directory is ignored")
     c = claim_from_geokeys(b"\x01\x00\x01")
     check(c.unit is None and c.source == "GeoTIFF keys",
           "a directory shorter than its own 4-value header claims nothing")
@@ -1593,6 +1836,12 @@ def _self_test(tmp):
     check(c.unit == "m" and c.name == "Local height" and c.code is None,
           "in a compound CRS the vertical part is read, not the horizontal "
           "feet before it")
+    c = claim_from_wkt(
+        'COMPD_CS["c",VERT_CS["V",AXIS["h",UP]],PROJCS["P",UNIT["US survey '
+        'foot",0.3048006096]],AUTHORITY["EPSG","7777"]]')
+    check(c.unit is None and c.code is None and c.name == "V",
+          "a vertical CRS with no unit does not borrow the unit or the code "
+          "of what follows it in a compound CRS")
     c = claim_from_wkt('PROJCS["Flat",UNIT["US survey foot",0.3048006096]]')
     check(c.unit is None and c.name is None and c.source == "WKT",
           "a WKT with no vertical CRS claims nothing")
@@ -1608,6 +1857,10 @@ def _self_test(tmp):
     c = claim_from_wkt('VERT_CS["No unit",AXIS["h",UP]]')
     check(c.unit is None,
           "a vertical CRS that names no unit claims none")
+    c = claim_from_wkt('VERT_CS["Odd",UNIT["metre",e]]')
+    check(c.unit is None and c.name == "Odd",
+          "a unit factor that is not a number claims no unit, and is not a "
+          "crash  <-- pinned defect")
 
     # ---- which record the file's CRS is in
     def claim_of(name, **kw):
@@ -1649,6 +1902,16 @@ def _self_test(tmp):
         raises(lambda: read_claim(handle, parse_header(handle.read(375))),
                "a header that counts more records than the file holds is "
                "refused", LasError)
+    put("vlr_last.las", good[:-1])
+    with open(path("vlr_last.las"), "rb") as handle:
+        raises(lambda: read_claim(handle, parse_header(handle.read(375))),
+               "a record that promises one byte more than remains is "
+               "refused", LasError)
+    put("vlr_exact.las", good)
+    with open(path("vlr_exact.las"), "rb") as handle:
+        check(read_claim(handle, parse_header(handle.read(375))).unit
+              == "usft",
+              "and one that promises exactly what remains is read")
     put("vlr_cut.las", good[:227 + 54 + 3])
     with open(path("vlr_cut.las"), "rb") as handle:
         raises(lambda: read_claim(handle, parse_header(handle.read(375))),
@@ -1719,23 +1982,35 @@ def _self_test(tmp):
                "a header that counts more points than the file holds is "
                "refused", LasError)
 
+    put("scan_one_short.las", _build_las(mixed)[:-1])
+    with open(path("scan_one_short.las"), "rb") as handle:
+        h = parse_header(handle.read(375))
+        raises(lambda: scan(handle, h, Sink()),
+               "a file one byte shorter than its points need is refused, "
+               "not read into a crash", LasError)
+
     many = [(float(i), 0.0, i * 0.01, 2) for i in range(50)]
     put("many.las", _build_las(many))
+    put("many_evlr.las", _build_las(many, minor=4, fmt=6, encoding=WKT_BIT,
+                                    evlrs=[("LASF_Projection", 2112,
+                                            b"VERT_CS[]" * 9)]))
     picked = {}
     saved = globals()["CHUNK"]
     try:
-        for chunk in (50000, 7, 1):
-            globals()["CHUNK"] = chunk
-            sink = Sink()
-            with open(path("many.las"), "rb") as handle:
-                h = parse_header(handle.read(375))
-                scan(handle, h, sink, stride=3)
-            picked[chunk] = [int(round(g[0])) for g in sink.got]
+        for name in ("many.las", "many_evlr.las"):
+            for chunk in (50000, 7, 1):
+                globals()["CHUNK"] = chunk
+                sink = Sink()
+                with open(path(name), "rb") as handle:
+                    h = parse_header(handle.read(375))
+                    scan(handle, h, sink, stride=3)
+                picked[name, chunk] = [int(round(g[0])) for g in sink.got]
     finally:
         globals()["CHUNK"] = saved
-    check(picked[50000] == list(range(0, 50, 3))
-          and picked[7] == picked[50000] and picked[1] == picked[50000],
-          "stride 3 picks the same points whatever the read chunk size"
+    check(picked["many.las", 50000] == list(range(0, 50, 3))
+          and all(v == picked["many.las", 50000] for v in picked.values()),
+          "stride 3 picks the same points whatever the read chunk size, "
+          "and a record list after the points is never read as points"
           "  <-- pinned defect")
 
     # ---- control points
@@ -1752,6 +2027,10 @@ def _self_test(tmp):
           and got_pairs[0].lidar == 1.0 and got_pairs[0].ref == 5.0,
           "a control point with too few ground points is counted, not "
           "compared, and the median of the rest is used")
+    check(ctl.pairs(4)[1] == 1 and len(ctl.pairs(4)[0]) == 1
+          and ctl.pairs(5)[1] == 2 and ctl.pairs(5)[0] == [],
+          "a control point with exactly --min-points ground points counts, "
+          "and one fewer does not")
     ctl = Controls([(9.9, 9.9, 1.0)], 10.0)
     ctl.add(10.1, 10.1, 4.0)
     check(ctl.heights == [[4.0]],
@@ -1809,6 +2088,8 @@ def _self_test(tmp):
     for label, text in (
             ("a header with no ncols", "nrows 1 xllcorner 0 yllcorner 0 "
                                       "cellsize 1 5"),
+            ("a header cut off after a keyword", "ncols 1 nrows 1 xllcorner "
+                                                 "0 yllcorner 0 cellsize"),
             ("a header with no origin", "ncols 1 nrows 1 cellsize 1 5"),
             ("an x origin by centre and a y origin by corner",
              "ncols 1 nrows 1 xllcenter 0 yllcorner 0 cellsize 1 5"),
@@ -1829,6 +2110,11 @@ def _self_test(tmp):
             ("an empty file", "")):
         raises(lambda t=text: parse_grid(t), "%s is refused" % label,
                GridError)
+    check("holds 3 cell values, and ncols times nrows is 4" in error_of(
+        lambda: parse_grid("ncols 2 nrows 2 xllcorner 0 yllcorner 0 "
+                           "cellsize 1 1 2 3"), GridError),
+          "a grid with the wrong number of values says how many it holds "
+          "and how many it needs")
     put_text("g_bom.asc", "\ufeff" + grid_text)
     check(parse_grid(read_text(path("g_bom.asc"))).ncols == 3,
           "a byte order mark in front of the grid header is skipped")
@@ -1852,6 +2138,27 @@ def _self_test(tmp):
         ColumnError)
     check("no columns at all" in empty_message,
           "an empty CSV says it has no columns")
+    accented = ["X,Y,Z,Desc"] + [
+        "%d,%d,%.4f,Mon\u00e9 %d\u00b0" % (x, y, _terrain(x, y), i)
+        for i, (x, y) in enumerate(_CONTROL_XY)]
+    cp1252_csv = put("c_cp1252.csv", "\n".join(accented).encode("cp1252"))
+    pts_read, skipped = read_controls(cp1252_csv, "X", "Y", "Z")
+    check(len(pts_read) == 8 and skipped == 0
+          and pts_read[0] == (1020.0, 2020.0, _terrain(1020, 2020)),
+          "a control CSV saved by Excel as Windows-1252, with an accent and "
+          "a degree sign in a description column, reads: X, Y and Z are "
+          "ASCII  <-- pinned defect")
+    pts_read, skipped = read_controls(
+        put("c_utf16.csv", "\n".join(accented).encode("utf-16")),
+        "X", "Y", "Z")
+    check(len(pts_read) == 8 and skipped == 0,
+          "and a UTF-16 CSV, which Excel's Unicode Text and PowerShell's "
+          "-Encoding Unicode write, reads too  <-- pinned defect")
+    pts_read, skipped = read_controls(
+        put("c_utf16be.csv", ("\ufeff" + "\n".join(accented)).encode(
+            "utf-16-be")), "X", "Y", "Z")
+    check(len(pts_read) == 8 and skipped == 0,
+          "in either byte order")
     check(to_number("1.5") == 1.5 and to_number("nan") is None
           and to_number(None) is None and to_number("") is None,
           "to_number reads a finite float and nothing else")
@@ -1902,14 +2209,19 @@ def _self_test(tmp):
         with open(path("evlr_cap.las"), "rb") as handle:
             raises(lambda: read_claim(handle, parse_header(handle.read(375))),
                    "a CRS record over the size cap is refused", LasError)
+        globals()["MAX_CRS_BYTES"] = len(wkt_rec[2])
+        with open(path("evlr_cap.las"), "rb") as handle:
+            at_cap = read_claim(handle, parse_header(handle.read(375)))
         big = [("other_vendor", 7, b"\1" * 500), wkt_rec]
         put("evlr_skip.las", _build_las(pts, minor=4, fmt=6, evlrs=big,
                                         encoding=WKT_BIT))
-        globals()["MAX_CRS_BYTES"] = 4096
+        globals()["MAX_CRS_BYTES"] = len(wkt_rec[2]) + 10
         with open(path("evlr_skip.las"), "rb") as handle:
             c = read_claim(handle, parse_header(handle.read(375)))
     finally:
         globals()["MAX_CRS_BYTES"] = saved
+    check(at_cap.unit == "m",
+          "a CRS record exactly the size of the cap is read")
     check(c.unit == "m",
           "a large record of another vendor is stepped over, and the CRS "
           "record after it is still found")
@@ -2021,6 +2333,14 @@ def _self_test(tmp):
           "the report names the claim, the control count and the pairs")
     check("FINDING" not in out and "pairs furthest" not in out,
           "an agreeing tile prints no finding and no list of worst pairs")
+    check(not any(word in out.replace(tmp, "") for word in (
+        "ASSUMED", "ignored", "no point has class", "cross-checked",
+        "still stand", "None", "UNIT_OFFSET", "parts per million"))
+          and "reference: %s, 8 control" % ctl_m in out
+          and "(named by the header)" in out,
+          "and none of the conditional sentences (assumed, ignored, no "
+          "ground, not cross-checked, still stand) is printed, while the "
+          "reference is named by its path")
 
     feet_tile = tile("feet.las", f=lambda z: z / FOOT)
     code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m")
@@ -2038,6 +2358,13 @@ def _self_test(tmp):
     code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
                       "--sample", "2")
     check(out.count("  x 10") == 2, "--sample 2 lists two pairs")
+    code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
+                      "--sample", "1")
+    check(out.count("  x 10") == 1, "--sample 1 lists one pair")
+    code, out, _ = go(ok, "--control", ctl_m, "--ref-unit", "m",
+                      "--min-points", "1")
+    check(code == 0 and "8 compared" in out,
+          "--min-points 1 is the smallest value allowed")
 
     low = tile("low27.las", f=lambda z: z - 27.0)
     code, out, _ = go(low, "--control", ctl_m, "--ref-unit", "m")
@@ -2102,6 +2429,20 @@ def _self_test(tmp):
           "a column the operator names that is not there is a usage error, "
           "exit 64, not a data error"
           "  <-- pinned defect")
+    code, out, err = go(ok, "--control", put_text(
+        "ctl_lower.csv", "x,y,z\n1020,2020,1\n"), "--ref-unit", "m")
+    check(code == 64 and "x, y, z" in err and "case sensitive" in err
+          and "--x-field, --y-field and --z-field" in err,
+          "lowercase column names are refused with the flags that fix it  "
+          "<-- pinned defect")
+    code, out, err = go(ok, "--control", cp1252_csv, "--ref-unit", "m")
+    check(code == 0 and "VERDICT: AGREES" in out and err == "",
+          "a Windows-1252 control file gives a verdict, not exit 70"
+          "  <-- pinned defect")
+    code, out, err = go(ok, "--control", path("c_utf16.csv"), "--ref-unit",
+                        "m")
+    check(code == 0 and "8 control point(s) read" in out and err == "",
+          "and so does a UTF-16 one  <-- pinned defect")
     code, out, _ = go(ok, "--control", put_text(
         "ctl_dirty.csv", "X,Y,Z\n1020,2020,%.4f\n,,\nx,y,z\n"
         % _terrain(1020, 2020)), "--ref-unit", "m")
@@ -2152,12 +2493,19 @@ def _self_test(tmp):
           "a tile against a grid in the same unit: exit 0, every ground "
           "point compared")
     code, out, _ = go(feet_tile, "--grid", grid_m, "--ref-unit", "m")
-    check(code == 1 and "VERDICT: UNIT." in out,
-          "grid mode finds the same unit error as control mode")
+    check(code == 1 and "VERDICT: UNIT." in out
+          and out.count("(1 point(s))") == 10,
+          "grid mode finds the same unit error as control mode, and each "
+          "pair is one ground point")
     code, out, _ = go(ok, "--grid", grid_m, "--ref-unit", "m",
                       "--max-samples", "100")
     check(code == 0 and "111 compared" in out,
           "--max-samples 100 takes every 4th point of 441, which is 111")
+    code, out, _ = go(ok, "--grid", grid_m, "--ref-unit", "m",
+                      "--max-samples", "1")
+    check(code == 4 and "1 compared" in out,
+          "--max-samples 1 is the smallest value allowed, and one pair "
+          "decides nothing")
     code, out, _ = go(ok, "--grid", grid_file("dem_ft.asc", 1 / FOOT),
                       "--ref-unit", "ft")
     check(code == 0, "a grid in feet with --ref-unit ft agrees")
@@ -2165,6 +2513,37 @@ def _self_test(tmp):
                       grid_m, "--ref-unit", "m")
     check(code == 1 and "VERDICT: OFFSET." in out,
           "a steady shift is found against a grid too")
+    for label, wrong, n_wrong, want in (
+            ("40 percent of the points in feet under a metre label",
+             lambda z: z / FOOT, 8, "Only 264 of 441 pairs (60 percent)"),
+            ("45 percent of the points 3 m high", lambda z: z + 3.0, 9,
+             "Only 242 of 441 pairs (55 percent)")):
+        merged = tile("merged.las", points=[
+            (x, y, wrong(_terrain(x, y)) if k % 20 < n_wrong
+             else _terrain(x, y), 2) for k, (x, y) in enumerate(_lattice())])
+        code, out, _ = go(merged, "--grid", grid_m, "--ref-unit", "m")
+        check(code == 1 and "VERDICT: MIXED." in out and want in out
+              and "VERDICT: AGREES" not in out
+              and "pairs furthest from the reference" in out,
+              "%s: MIXED and exit 1, not AGREES and exit 0  "
+              "<-- pinned defect" % label)
+    sentinel_rows = []
+    for r in range(21):
+        y = 2100 - 5 * r
+        sentinel_rows.append(" ".join(
+            "-3.40282347e+38" if r < 10 else "%.4f" % _terrain(1000 + 5 * c, y)
+            for c in range(21)))
+    sentinel = put_text("dem_sentinel.asc",
+                        "ncols 21\nnrows 21\nxllcorner 997.5\n"
+                        "yllcorner 1997.5\ncellsize 5\n"
+                        "NODATA_value -3.4028234663852886e+38\n"
+                        + "\n".join(sentinel_rows) + "\n")
+    code, out, _ = go(ok, "--grid", sentinel, "--ref-unit", "m")
+    check(code == 1 and "VERDICT: MIXED." in out
+          and "Only 231 of 441 pairs (52 percent)" in out,
+          "a NoData value written with different digits in the header and "
+          "in the cells reads 210 cells as heights of -3e38: MIXED, not "
+          "AGREES  <-- pinned defect")
     code, out, _ = go(ok, "--grid", grid_file("dem_far.asc", x0=50000.0),
                       "--ref-unit", "m")
     check(code == 4 and "0 compared, 441 skipped" in out,
@@ -2178,7 +2557,8 @@ def _self_test(tmp):
     # ---- the claim decides what is checked
     nolabel = tile("nolabel.las", vlrs=[])
     code, out, err = go(nolabel, "--control", ctl_m, "--ref-unit", "m")
-    check(code == 3 and "REFUSED" in out and "--assume-unit" in out,
+    check(code == 3 and "REFUSED" in out and "--assume-unit" in out
+          and "FINDING" not in out,
           "a header with no vertical unit is refused: exit 3, never "
           "guessed")
     code, out, _ = go(nolabel, "--control", ctl_m, "--ref-unit", "m",
@@ -2251,7 +2631,9 @@ def _self_test(tmp):
           "a tile with no ground points says so and decides nothing")
     code, out, _ = go(ground_none, "--control", ctl_m, "--ref-unit", "m",
                       "--any-class")
-    check(code == 0, "--any-class compares points of every class")
+    check(code == 0 and "no point has class" not in out,
+          "--any-class compares points of every class, and does not say "
+          "that nothing was compared")
     code, out, _ = go(ground_none, "--control", ctl_m, "--ref-unit", "m",
                       "--ground-class", "1")
     check(code == 0, "--ground-class names another class as the ground")
@@ -2285,6 +2667,8 @@ def _self_test(tmp):
     check(code in (2, 4), "a control row with a NUL byte does not crash")
 
     # ---- usage errors are 64, and nothing is written
+    hard_link = path("ok_link.las")
+    os.link(ok, hard_link)
     for label, argv, word in (
             ("no tile", ["--control", ctl_m, "--ref-unit", "m"], "tile"),
             ("no reference", [ok, "--ref-unit", "m"], "exactly one"),
@@ -2313,6 +2697,14 @@ def _self_test(tmp):
                                     "m", "--out", ctl_m], "also an input"),
             ("out is the grid", [ok, "--grid", grid_m, "--ref-unit", "m",
                                  "--out", grid_m], "also an input"),
+            ("out is a hard link to the tile", [ok, "--control", ctl_m,
+                                                "--ref-unit", "m", "--out",
+                                                hard_link, "--apply"],
+             "also an input"),
+            ("out is the tile by another spelling", [
+                ok, "--control", ctl_m, "--ref-unit", "m", "--out",
+                os.path.join(tmp, ".", os.path.basename(ok))], "also an "
+             "input"),
             ("a unit that is not offered", [ok, "--control", ctl_m,
                                             "--ref-unit", "yd"], "yd"),
             ("an unknown flag", [ok, "--control", ctl_m, "--ref-unit", "m",
@@ -2356,10 +2748,45 @@ def _self_test(tmp):
         written = list(csv.DictReader(handle))
     check(list(written[0].keys()) == list(OUT_COLUMNS) and len(written) == 8,
           "the residual CSV has the documented columns and one row per pair")
+    check(all(r["points"] == "13" for r in written),
+          "each control point is compared with the 13 ground points of the "
+          "5 unit lattice within 10 units of it, none skipped by a stride")
     check(abs(float(written[0]["residual_m"])) > 5.0
           and len(written[0]["residual_m"].split(".")[1]) == 4,
           "and its residuals are the ones for the unit the header claims, to "
           "four places")
+    check(all(abs(float(r["lidar_z"]) - float(r["reference_z"])
+                  - float(r["residual_m"])) < 3e-4 for r in written)
+          and all(float(r["residual_m"]) > 5.0 for r in written),
+          "each residual is the lidar Z minus the reference Z, so a tile "
+          "that holds feet under a metre label sits high, not low"
+          "  <-- pinned defect")
+    code, out, _ = go(feet_tile, "--control", ctl_m, "--ref-unit", "m",
+                      "--sample", "3", "--out", target, "--apply")
+    with open(target, "r", newline="") as handle:
+        written = list(csv.DictReader(handle))
+    furthest = sorted((float(r["residual_m"]) for r in written),
+                      key=lambda v: -abs(v))[:3]
+    listed = [line for line in out.splitlines() if line.startswith("  x ")]
+    check(len(listed) == 3 and all(
+        ("%+.4f m" % v) in line for v, line in zip(furthest, listed)),
+          "the worst pairs are listed furthest first, with the residual the "
+          "CSV holds  <-- pinned defect")
+    usft_tile = tile("usft_ft.las", f=lambda z: z / US_SURVEY_FOOT,
+                     vlrs=_crs_vlrs(6360))
+    code, out, _ = go(usft_tile, "--control", control_csv(
+        "ctl_ft3.csv", unit_scale=1 / FOOT), "--ref-unit", "ft", "--out",
+        target, "--apply")
+    with open(target, "r", newline="") as handle:
+        written = list(csv.DictReader(handle))
+    check(code == 0 and len(written) == 8 and all(
+        abs(float(r["residual_m"])) < 0.02
+        and abs(float(r["residual_m"]) - (
+            float(r["lidar_z"]) * US_SURVEY_FOOT
+            - float(r["reference_z"]) * FOOT)) < 5e-4 for r in written),
+          "a US survey foot tile against a control file in feet: each "
+          "factor multiplies its own side, so the residuals are near zero"
+          "  <-- pinned defect")
     go(ok, "--control", ctl_m, "--ref-unit", "m", "--out", target, "--apply")
     check(hashlib.sha256(slurp(ok)).hexdigest() == before,
           "the tile is byte for byte what it was after the runs")
@@ -2372,6 +2799,24 @@ def _self_test(tmp):
           in out.replace("\n", " ").replace("  ", " "),
           "--help exits 0 and says nothing is written without --apply")
 
+    # ---- the file run as a program, and imported
+    saved_argv = sys.argv
+    source_path = __file__.replace(".pyc", ".py")
+    status, helped = "no exit", io.StringIO()
+    try:
+        sys.argv = ["zdatum.py", "--help"]
+        with contextlib.redirect_stdout(helped):
+            runpy.run_path(source_path, run_name="zdatum_imported")
+            try:
+                runpy.run_path(source_path, run_name="__main__")
+            except SystemExit as exc:
+                status = exc.code
+    finally:
+        sys.argv = saved_argv
+    check(status == 0 and helped.getvalue().count("usage:") == 1,
+          "run as a program the file exits with the status main returns, "
+          "and imported it runs nothing")
+
     # ---- the source itself
     with open(__file__.replace(".pyc", ".py"), "rb") as handle:
         source = handle.read()
@@ -2382,6 +2827,25 @@ def _self_test(tmp):
           "the tool imports nothing that can reach a network")
     check(not re.search(br"[^\w]f['\"]", source),
           "the source has no f-string, for Python 3.9")
+
+    # ---- a console that cannot encode a character does not crash print()
+    class Stream(object):
+        def __init__(self):
+            self.calls = []
+
+        def reconfigure(self, **kw):
+            self.calls.append(kw)
+
+    real_out, real_err = sys.stdout, sys.stderr
+    fake_out, fake_err = Stream(), Stream()
+    try:
+        sys.stdout, sys.stderr = fake_out, fake_err
+        _tolerate_odd_characters()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+    check(fake_out.calls == [{"errors": "replace"}]
+          and fake_err.calls == [{"errors": "replace"}],
+          "stdout and stderr are told to replace what they cannot encode")
 
     # ---- a crash is 70, never a finding
     real = globals()["_run"]
@@ -2424,5 +2888,5 @@ def _self_test(tmp):
 # SELF-TEST-END
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     sys.exit(main())

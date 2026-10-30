@@ -1,7 +1,12 @@
 # zdatum
 
-Check the Z values of a lidar tile against a reference surface you trust, and say whether they are
-in the unit and the vertical datum the LAS header claims. It never changes the tile.
+Check the Z values of a lidar tile against a reference surface you trust. It tells you when the
+values are in a different unit than the LAS header claims, or sit a large steady distance from the
+reference, or when part of the tile disagrees with the rest. It never changes the tile.
+
+It does not confirm a vertical datum. A datum or geoid difference smaller than the tolerance (0.30 m
+by default) reads as `AGREES`. The reference must itself be in the datum the header names. If it is
+not, an `OFFSET` verdict is as likely to be a fault in the reference as in the tile.
 
 Here is how the failure goes. A contractor delivers a whole project area of lidar tiles. Every header says
 `NAVD88 height`, metres. One batch was cut from a source in US survey feet, and a script wrote the
@@ -43,8 +48,23 @@ not in this repo, which holds four files. The self-test builds equivalent tiles 
 
 ## What already exists
 
-This tool adds a comparison. It does not add a new way to convert or to validate.
+This tool adds a quick comparison. It does not add a new way to convert, to validate, or to certify
+accuracy.
 
+- **Vertical accuracy checkpoints.** This is the usual way to check lidar heights, and it does a
+  job this tool does not. The USGS page on its
+  [updated accuracy standards](https://www.usgs.gov/ngp-standards-and-specifications/adopt-updated-accuracy-standards)
+  (Lidar Base Specification 2024 rev. A, which follows the second edition of the ASPRS positional
+  accuracy standards) tests a product against independent survey checkpoints. It names a vertical
+  RMSE as the measure, at least 30 checkpoints, and a check source at least two times more accurate
+  than the data. It ends in an accuracy statement you can put in a report. I read that page. I did
+  not run any lidar package that implements the procedure. This tool gives no accuracy figure.
+  It is a first look that tells you, before the formal check, that the unit or the level is wrong.
+- **LIDAR-QAQC.** [gvonkrosigk/LIDAR-QAQC](https://github.com/gvonkrosigk/LIDAR-QAQC) is described as
+  a USGS LiDAR QA/QC system for 3DEP vertical accuracy. Its README describes a web application
+  that registers surfaces, imports checkpoints, samples raster or point-surface elevations and
+  shows QA runs. I read the README. I did not run it. It is a database-backed application and this
+  is a single file.
 - **PDAL.** [`filters.reprojection`](https://pdal.io/en/latest/stages/filters.reprojection.html)
   moves X, Y and Z between coordinate systems. Its example converts ellipsoidal heights to
   orthometric heights with a PROJ geoid grid. It starts from the system you name or the one the file
@@ -59,11 +79,12 @@ This tool adds a comparison. It does not add a new way to convert or to validate
   is described as converting the horizontal and vertical datum of an aerial point cloud. I did not
   run it or read its code, so I cannot say whether it checks its input.
 
-`gh search repos` on the day this was written returned nothing for `zdatum`, and nothing that checks
-Z against a reference for the queries `lidar vertical datum`, `las header vertical datum`, `lidar
-vertical accuracy check control points` and `lidar units feet meters mismatch` except the
-conversion tool above. That shows only that the search found nothing. Desktop lidar packages may
-have vertical accuracy reports. I did not look at those.
+`gh search repos` on 2026-10-29 returned only this repository for `zdatum`. It returned nothing
+that checks Z against a reference for `lidar vertical datum check`, `las header vertical datum`,
+`lidar vertical accuracy check control points`, `lidar units feet meters mismatch` and `las z units
+feet metres validate`. The queries `lidar qaqc` and `lidar geoid` found the two projects above. That
+shows only that the search found nothing more. Desktop lidar packages may have vertical accuracy
+reports. I did not look at those.
 
 ## What it decides
 
@@ -81,21 +102,48 @@ Then it asks two questions of the residuals, which are lidar minus reference, in
 2. If it is in the other unit (metres against feet), what are they?
 
 The spread is the median absolute deviation. A median counts only when the spread is small,
-because a bias of scattered numbers is noise. The verdict follows.
+because a bias of scattered numbers is noise. A median and a spread both ignore a minority, so it
+also counts only when at least 90 percent of the pairs lie within the tolerance of it. Without
+that, a tile that is 40 percent wrong still reads `AGREES`. The verdict follows.
 
 | Verdict | Meaning | Exit |
 |---|---|---|
-| `AGREES` | The header's unit fits, and the median is inside the tolerance. | 0 |
+| `AGREES` | The header's unit fits, the median is inside the tolerance, and 90 percent of the pairs are. | 0 |
 | `UNIT` | The other unit fits. The label is wrong. | 1 |
 | `OFFSET` | The unit fits, but the values sit a steady distance away. | 1 |
 | `UNIT_OFFSET` | The other unit fits, and with a steady distance too. | 1 |
 | `SCATTER` | Neither unit gives one steady shift. | 1 |
+| `MIXED` | One shift fits most pairs, but fewer than 90 percent of them. Part of the tile is wrong. | 1 |
 | `NOT DECIDED` | Too few pairs, no overlap, or a reference that cannot tell the units apart. | 4 |
 
 A steady offset is what a different vertical datum, a different geoid model, or an ellipsoid
 height read as an orthometric height looks like. The tool cannot tell those apart, and it says so.
 When the offset is over `--big-offset` (5 m by default) it adds a hint to test the
 ellipsoid-height explanation first. That threshold is a heuristic, not a standard.
+
+`MIXED` is what a tile merged from two deliveries looks like, and what a reference with bad cells
+looks like. This run has 40 percent of the points in feet under a metre label:
+
+```
+$ python zdatum.py mixed.las --grid dem_m.asc --ref-unit m --sample 2
+relief of the reference: 11.000 m
+  if stored Z is in the header's unit (metre): median +0.0000 m, spread 0.0000 m
+  if stored Z is in the other unit    (international foot): median -10.5670 m, spread 3.8236 m
+
+pairs furthest from the reference, if the header is right:
+  x 1100.000 y 2100.000  lidar 75.4600  reference 23.0000  +52.4600 m  (1 point(s))
+  x 1100.000 y 2035.000  lidar 64.8000  reference 19.7500  +45.0500 m  (1 point(s))
+
+VERDICT: MIXED. Only 264 of 441 pairs (60 percent) lie within 0.300 m of the one shift that fits
+best (metre, median +0.0000 m), and at least 90 percent must. Part of the tile disagrees with the
+rest: two deliveries merged, two units in one file, NoData read as heights, or a reference with bad
+cells.
+$ echo $?
+1
+```
+
+The median and the spread of that tile are both zero. Before the share check it printed `AGREES`
+and exited 0.
 
 `NOT DECIDED` is the important answer. A flat site cannot tell metres from feet, because the same
 numbers fit both with a shift. Here the reference spans 0.12 m and the tile is 27 m low:
@@ -127,33 +175,38 @@ The exit code is 4. It is not 0. A tool that said `OFFSET` here would be guessin
   writer that never filled the field leaves it that way.
 - **A header with no vertical unit** is refused with exit 3. Give `--assume-unit` if you know it.
   The datum itself is never assumed.
+- **Record lengths and counts** come from the file, so each is checked against the bytes that
+  remain before it is read. A scale factor or offset that is not a finite number is refused.
 - **LAZ** is refused with exit 2 by name. Decompress it first.
 
 ## Requirements
 
-Python 3.9 or newer. The standard library only. No `arcpy`, no `laspy`, no network.
+Python 3.9 or newer. The standard library only. No `arcpy`, no `laspy`, no network. The self-test
+makes one hard link in its temporary directory, so that directory must be on a file system that
+supports them (NTFS and ext4 do).
 
 ```
 git clone https://github.com/uhsear/zdatum.git
 python zdatum.py --self-test
 ```
 
-The self-test prints the same assertions on every host listed here, and the output matches line for
-line between Windows 3.13.2 and Ubuntu 3.12.3.
+The self-test prints the same assertions on every host listed here. After the carriage returns of
+Windows are removed, the output of Windows 3.9.25 and 3.13.2 matches the output of Ubuntu 3.12.3
+line for line.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 233, 0 failed |
-| Windows | 3.12 | 233, 0 failed |
-| Windows | 3.9.25 | 233, 0 failed |
-| Ubuntu | 3.12.3 | 233, 0 failed |
+| Windows | 3.13.2 | 301, 0 failed |
+| Windows | 3.12 | 301, 0 failed |
+| Windows | 3.9.25 | 301, 0 failed |
+| Ubuntu | 3.12.3 | 301, 0 failed |
 
 The counts are equal because no assertion depends on the platform. The self-test builds every
 file it needs in a temporary directory and removes it, even when an assertion raises.
 
-`coverage run --branch zdatum.py --self-test` reports 100 percent of statements and branches. One
-line carries `# pragma: no cover`: the `if __name__ == "__main__":` line, whose false branch cannot
-run when the file is the program.
+`coverage run --branch zdatum.py --self-test` reports 100 percent of statements and branches, and
+excludes nothing. The self-test runs the file a second time with `runpy`, once under the name
+`__main__` and once under another name, so both sides of the `if __name__ == "__main__":` line run.
 
 ## The self-test
 
@@ -161,7 +214,6 @@ run when the file is the program.
 $ python zdatum.py --self-test
 zdatum self-test: temporary files only, no network, no credentials
 --------------------------------------------------------------------
-...
 PASS  the international foot is exactly 0.3048 metre
 ...
 PASS  metres claimed but the values are the reference in feet is UNIT  <-- pinned defect
@@ -170,11 +222,19 @@ PASS  a steady 27 m below the reference is OFFSET, units as claimed  <-- pinned 
 ...
 PASS  a reference near zero cannot tell metres from feet, so the answer is NOT DECIDED, not AGREES  <-- pinned defect
 ...
+PASS  two pairs of ten wrong by 40 m is 80 percent, which is MIXED, not AGREES  <-- pinned defect
+...
 PASS  LAZ (point format plus 128) is refused by name, not read as junk  <-- pinned defect
+...
+PASS  a control CSV saved by Excel as Windows-1252, with an accent and a degree sign in a description column, reads: X, Y and Z are ASCII  <-- pinned defect
 ...
 PASS  an EVLR length of 2^63 is refused, not allocated  <-- pinned defect
 ...
 PASS  point format 6 with the WKT bit clear reads the WKT record and names the error  <-- pinned defect
+...
+PASS  40 percent of the points in feet under a metre label: MIXED and exit 1, not AGREES and exit 0  <-- pinned defect
+...
+PASS  a NoData value written with different digits in the header and in the cells reads 210 cells as heights of -3e38: MIXED, not AGREES  <-- pinned defect
 ...
 PASS  a prefix --ap of --apply is REFUSED by the parser, and nothing is written  <-- pinned defect
 ...
@@ -182,19 +242,26 @@ PASS  a prefix --appl of --apply is REFUSED by the parser, and nothing is writte
 ...
 PASS  --out without --apply writes nothing and says so  <-- pinned defect
 ...
+PASS  each residual is the lidar Z minus the reference Z, so a tile that holds feet under a metre label sits high, not low  <-- pinned defect
+...
 PASS  an unexpected error exits 70, which no scheduled job reads as a finding  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 ...
 --------------------------------------------------------------------
-233 assertions, 0 failed
+301 assertions, 0 failed
 ```
 
-Each `...` is where this block is cut. The full run prints all 233 assertions. A line marked
+Each `...` is where this block is cut. The full run prints all 301 assertions. A line marked
 `<-- pinned defect` is a bug found while building, or a failure the tool exists to catch. It
-fails if the fix is removed. I checked that by breaking the code on purpose: 19 changes to the
-tool each made the self-test fail, and one changed nothing. That one was a count check that the
-loop already made unnecessary, and I deleted it.
+fails if the fix is removed.
+
+I also broke the decision and command code on purpose with 769 small changes: a comparison
+flipped, a constant moved by one, a branch forced on or off. The self-test failed for 735 of them.
+The other 34 change nothing a caller can see. They are default values that every caller overwrites,
+a `1e-9` slack that no input can land on, a read size that only changes how many bytes are read at
+once, a test that is already implied by the one after it, and a few characters of a slice that no later
+step reads. The harness is not in this repo.
 
 ## Quick start
 
@@ -216,7 +283,7 @@ python zdatum.py tile.las --control control.csv --ref-unit m --out residuals.csv
 | `--grid FILE` | Reference: an Esri ASCII raster. Name exactly one of `--control` and `--grid`. |
 | `--ref-unit {m,ft,usft}` | The Z unit of the reference. Required. |
 | `--assume-unit {m,ft,usft}` | The tile's Z unit, used only when the header names none. |
-| `--x-field`, `--y-field`, `--z-field` | Control CSV column names. Default `X`, `Y`, `Z`. |
+| `--x-field`, `--y-field`, `--z-field` | Control CSV column names. Default `X`, `Y`, `Z`. Names are case sensitive and are not trimmed. |
 | `--tolerance M` | Metres a median residual or its spread may reach. Default 0.30. |
 | `--radius R` | How far a ground point may be from a control point, in the tile's horizontal units. Default 10. |
 | `--min-points N` | Ground points needed near a control point. Default 3. |
@@ -231,34 +298,45 @@ python zdatum.py tile.las --control control.csv --ref-unit m --out residuals.csv
 
 The only file this tool can write is the `--out` CSV, and only with `--apply`. The parser is built
 with `allow_abbrev=False`. A prefix of a flag is refused, so `--ap` does not mean `--apply`. The
-self-test pins `--ap`, `--app` and `--appl`, and checks that nothing is written.
+self-test pins `--ap`, `--app` and `--appl`, and checks that nothing is written. It also checks that
+`--out` is refused when it names the tile, the control file or the grid, including by a hard link
+or by a `./` spelling.
 
 The tolerance is a bias test. It is not an accuracy standard and it is not taken from one. The 5 m
-`--big-offset`, the 10 unit `--radius` and the 5 pair minimum are defaults I chose. They are
-constants at the top of the file.
+`--big-offset`, the 10 unit `--radius` and the 3 point `--min-points` are defaults I chose. The 5 pair
+minimum and the 90 percent share are constants at the top of the file, not flags.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | The Z values agree with the reference in the header's unit. |
-| 1 | At least one finding: a unit error, a steady offset, scatter, or a header that contradicts itself or its Z range. |
+| 1 | At least one finding: a unit error, a steady offset, scatter, a mixed tile, or a header that contradicts itself or its Z range. |
 | 2 | A file could not be read, or is a format this tool does not read (LAZ). |
 | 3 | The header names no vertical unit and `--assume-unit` was not given. |
 | 4 | Not decided: too few pairs, no overlap, or a reference that cannot tell metres from feet. |
 | 64 | Usage error, including a misspelt flag, a missing `--ref-unit`, and a CSV column that is not there. |
 | 70 | An unexpected crash. It is never a finding. |
 
+A header finding overrides the verdict. A duplicate CRS record, a Z range that does not match the
+points, or a clear WKT bit on point format 6 to 10 makes the exit code 1 even when the verdict is
+`AGREES` (which would be 0) or `NOT DECIDED` (which would be 4).
+
 Exit 70 matters. Python exits 1 on an uncaught error, and a scheduled job would read that as "a
 finding". A fault in the tool is not a fact about your data.
 
 The residual CSV has the columns `x, y, lidar_z, reference_z, points, residual_m`, with
-`residual_m` computed for the unit the header names.
+`residual_m` computed for the unit the header names: lidar Z times that unit's factor, minus the
+reference Z times its factor, in metres.
 
 ## The reference
 
 **Control points** are a CSV with a header row. Rows with a blank, a word or an infinity in X, Y or
-Z are counted as skipped, never read as zero. A byte order mark is skipped.
+Z are counted as skipped, never read as zero. A byte order mark is skipped. A file saved as
+Windows-1252 (Excel's "CSV") or as UTF-16 (Excel's "Unicode Text", PowerShell's
+`-Encoding Unicode`) is read: a byte that is not valid UTF-8 is replaced, because X, Y and Z are
+plain numbers. Column names are matched exactly. Lowercase `x,y,z` exits 64, and the message names
+`--x-field`, `--y-field` and `--z-field`.
 
 **A grid** is an Esri ASCII raster. Per Esri's
 [format page](https://resources.arcgis.com/en/help/main/10.1/009t/009t0000000z000000.htm), the
@@ -268,6 +346,11 @@ both centre. The tool refuses a grid that mixes them. Esri's page does not say w
 are case sensitive. The tool accepts either case. Values are sampled bilinearly between cell
 centres. A sample that touches NoData gives no value and counts as skipped.
 
+Only these two forms are read. A GeoTIFF or a file geodatabase DEM must be exported to an ASCII
+grid first, for example with the ArcGIS Pro
+[Raster to ASCII](https://pro.arcgis.com/en/pro-app/latest/tool-reference/conversion/raster-to-ascii.htm)
+tool.
+
 Neither reference is projected or converted. The tile and the reference must share a horizontal
 coordinate system, and `--radius` is in the tile's horizontal units.
 
@@ -275,10 +358,12 @@ coordinate system, and `--radius` is in the tile's horizontal units.
 
 Each fact the tool relies on, and where it was checked.
 
-- **LAS 1.4 R15** ([ASPRS](https://www.asprs.org/wp-content/uploads/2019/07/LAS_1_4_r15.pdf)), read
-  from a local copy. The WKT bit and Table 2 of the CRS representation. The rule that more than one
+- **LAS 1.4 R15**, published by ASPRS, read from a local copy. The maintained text is the
+  [ASPRSorg/LAS](https://github.com/ASPRSorg/LAS) repository. The PDF address ASPRS used for R15
+  (`asprs.org/wp-content/uploads/2019/07/LAS_1_4_r15.pdf`) returned HTTP 404 on 2026-10-29, so it is
+  not linked. The WKT bit and Table 2 of the CRS representation. The rule that more than one
   GeoTIFF or WKT record is a file error. The "Superseded" convention. Max Z stored before Min Z.
-  Formats 6 to 10 must use WKT.
+  Formats 6 to 10 must use WKT. The record length of each point format.
 - **The foot.** The international foot is exactly 0.3048 m. The US survey foot is 1200/3937 m.
   [NIST](https://www.nist.gov/pml/us-surveyfoot) and NOAA's National Geodetic Survey
   [deprecated](https://geodesy.noaa.gov/web/news/pdf/Notice-Final-Determination-Retiring-US-Survey-Foot.pdf)
@@ -298,6 +383,9 @@ Each fact the tool relies on, and where it was checked.
   the header keys, the -9999 default, row 1 at the top, and the origin match rule. The ArcGIS Pro
   [ASCII to Raster](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/conversion/ascii-to-raster.html)
   page names the centre alternative to the corner keys.
+- **Vertical accuracy checkpoints.** The USGS
+  [page on updated accuracy standards](https://www.usgs.gov/ngp-standards-and-specifications/adopt-updated-accuracy-standards),
+  for the sentences in "What already exists".
 - **PDAL.** The [reprojection stage](https://pdal.io/en/latest/stages/filters.reprojection.html), for
   the sentences in "What already exists".
 
@@ -316,21 +404,26 @@ lattice over a sloping plane with 11 m of relief. The control file has 8 points.
 | `ellipsoid_like.las` | metres, 27 m low | `OFFSET`, with the ellipsoid hint | 1 |
 | `flat_low.las` | 0.12 m of relief, 27 m low | `NOT DECIDED` | 4 |
 
+I ran these again on 2026-10-29 against the current file. The verdicts and exit codes did not
+change. The `MIXED` run above used a tile the self-test builder wrote, not laspy.
+
 The grid run above (`feet_labelled_m.las` against `dem_m.asc`) was repeated on Ubuntu 3.12.3 and
 gave the same verdict and exit 1. With `--out resid.csv --apply` it wrote 441 rows plus the header.
 
-A tile of 3 million points (90 MB) took about 1 second against a grid and about 7 seconds against
-control points on this workstation. Control mode visits every ground point near every control point,
-so it costs more per point.
+A tile of 3.0 million points (90 MB, point format 6) took 1.7 to 2.0 seconds against a grid and
+9.6 to 10.2 seconds against control points. These are three runs each on this Windows workstation
+with Python 3.13.2. Control mode visits every ground point near every control point, so it costs
+more per point.
 
 ## What it will not do
 
 - **Name the datum.** A steady offset is one number. It does not say NAVD88 against an ellipsoid.
+- **See a small datum shift.** A shift under `--tolerance` reads as `AGREES`.
 - **Check the horizontal coordinates.** They are assumed to share a system with the reference.
 - **Tell one foot from the other.** The two feet differ by 2 parts per million. Z values at the
   heights of a normal survey cannot show it.
 - **Trust a single bad control point.** The median resists one wild value. A reference with several
-  bad points gives `SCATTER`, which is also a finding about the reference.
+  bad points gives `SCATTER` or `MIXED`, which is also a finding about the reference.
 - **Decide without relief.** See `NOT DECIDED`.
 - **Read LAZ.** Decompress it first.
 - **Repair anything.** It writes no tile. Use PDAL or your lidar package to fix one.
@@ -345,14 +438,69 @@ so it costs more per point.
   compression bit in the point format byte, which is how the LAS specification marks it.
 - **Real survey data were not used.** Every tile and every control file is synthetic. The numbers
   show the logic, not the accuracy on a real site.
+- **A reference grid coarser than the terrain relief allows gives `SCATTER` on a correct tile.**
+  On a synthetic surface with 10 m of amplitude and a 75 m wavelength, cells of 10 m left a spread of
+  0.35 m, which is over the default 0.30 m. Cells of 20 m left 1.6 m and cells of 30 m left 2.7 m.
+  Raise `--tolerance` or use a finer reference on hilly ground.
+- **The 90 percent share is a constant I chose.** Ground points that sit on something else count
+  against it, and `--any-class` makes that worse.
+- **NoData is matched by exact float equality with the header value.** A sentinel written with
+  different precision in the header and in the cells (for example `-3.4028234663852886e+38` against
+  `-3.40282347e+38`) is read as real data. The `MIXED` verdict catches it only when it touches more
+  than a tenth of the pairs.
+- **Grid points closer than half a cell to the raster edge get no reference value** and count as
+  skipped. So do points on the first or last cell centre that float rounding places a hair outside.
+- **The check that the file holds the promised number of points counts trailing EVLR bytes as point
+  room.** An over-stated point count on a LAS 1.4 file with EVLRs reads EVLR bytes as points
+  instead of exiting 2. The run I tried ended in `NOT DECIDED` with no pairs.
+- **A header Z range that is NaN skips the range cross-check silently.** Every comparison with NaN
+  is false.
+- **A scale, offset or radius extreme enough to overflow a float to infinity exits 70.** It raises
+  `OverflowError` in `Controls._cell`. `--radius 1e-320` does it.
+- **A file that is shorter than the header promises because it changed during the read exits 70**
+  with a `struct.error`, not 2.
+- **For a WKT vertical CRS with no `AUTHORITY` of its own, the EPSG code shown is the last EPSG
+  authority inside the block.** That can be the datum's code (5103) or the unit's (9001). It is
+  display only. The unit is read separately.
+- **A WKT vertical record whose EPSG code and unit disagree raises no finding.** `AUTHORITY
+  ["EPSG","5703"]` (metre) with `UNIT["US survey foot",...]` is read as US survey feet. The GeoTIFF
+  key path flags the same contradiction, so the two paths differ.
+- **A WKT vertical unit that is not metre, foot or US survey foot** (a decimetre, say) is treated as
+  no unit. With `--assume-unit` the report then says "ASSUMED ... The header did not say", though it
+  did name a unit.
+- **Esri-flavoured WKT that spells the vertical CRS `VERTCS[...]` is not recognised.** The tool
+  reports that the header names no vertical unit and exits 3. That is a refusal, not a wrong
+  verdict, but the message does not say that the record was present and not parsed.
+- **GeoTIFF vertical keys are read as direct values** even when the key says the value lives in
+  another tag.
+- **The WKT bit of the global encoding is read for LAS 1.0 to 1.3 files too,** where the bit is not
+  defined. A stray set bit sends the read to the WKT record and can end in exit 3.
+- **The residual CSV is written even when the verdict is `NOT DECIDED`,** and then holds a header
+  row and few or no rows.
+- **`--apply` overwrites an existing `--out` file without asking.** Only the tile, the control file
+  and the grid are protected, and they are compared as files, so a hard link is caught.
+- **The `--out` file is written in place.** A disk-full or I/O error part-way through leaves a
+  partial CSV, and the tool exits 2 after it printed the verdict.
+- **A control CSV column name with a space in it needs the space in the flag.** `--z-field " Z"`
+  reads a header `X,Y, Z`.
+- **Only Esri ASCII grids and control CSVs are read.** The grid reader loads the whole file into
+  memory and splits it into tokens, so a grid of hundreds of millions of cells needs many gigabytes
+  and may exit 70 with `MemoryError`.
+- **Text taken from the files is printed raw,** including control and escape characters: the
+  vertical CRS name in the header, the CSV header names in a column error, and the tile path. A
+  hostile file can write terminal escape sequences. Do not pipe the output into something that
+  interprets them.
+- **Output piped to a program that closes early** (`zdatum.py ... | head -1`) can end with a Python
+  flush error or a non-zero exit that does not mean a finding. The tool does not handle a closed
+  stdout.
+- **Ctrl-C ends with Python's traceback and the signal exit status,** not one of the documented
+  exit codes.
 - **Withheld, synthetic and key-point flags are ignored.** For formats 0 to 5 the class is the low
   five bits of the class byte, so a class 2 point that carries a flag still counts as ground.
-- **Control mode memory.** It keeps the ground heights near each control point. A dense tile with
-  many control points holds many floats.
+- **Control mode memory.** It keeps the ground heights near each control point. A very dense tile
+  with many control points and a large `--radius` holds many floats.
 - **The ellipsoid hint is a heuristic.** Five metres is an assumption, not a figure from a
   standard.
-- **The `if __name__ == "__main__":` line carries `# pragma: no cover`.** Every other statement and
-  branch is covered.
 - **No network and no credentials.** The tool reads local files only. The self-test checks that its
   own source imports no network module, so no stub server was needed.
 
